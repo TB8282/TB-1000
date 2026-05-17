@@ -39,20 +39,17 @@ def webhook():
                 if value <= -ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value, "candle": candle}
             else:
-                if value > anchor["value"]:
+                if value <= anchor["value"]:
+                    # New green dot is lower — update anchor
+                    state["green_anchor"] = {"value": value, "candle": candle}
+                else:
+                    # New green dot is higher — check for LONG entry
                     gap = candle - state["last_red_candle"]
                     if gap > MIN_GAP and not state["in_trade"]:
                         state["in_trade"] = True
                         state["trade_side"] = "LONG"
                         state["green_anchor"] = None
                         state["trades"].append({"time": datetime.utcnow().strftime("%Y-%m-%d %H:%M"), "side": "LONG", "status": "OPEN"})
-                    if value <= -ANCHOR_LEVEL:
-                        state["green_anchor"] = {"value": value, "candle": candle}
-                else:
-                    if value <= -ANCHOR_LEVEL:
-                        state["green_anchor"] = {"value": value, "candle": candle}
-                    else:
-                        state["green_anchor"] = None
 
         elif dot == "red":
             state["last_red_candle"] = candle
@@ -61,22 +58,20 @@ def webhook():
                 if value >= ANCHOR_LEVEL:
                     state["red_anchor"] = {"value": value, "candle": candle}
             else:
-                if value < anchor["value"]:
+                if value >= anchor["value"]:
+                    # New red dot is higher — update anchor
+                    state["red_anchor"] = {"value": value, "candle": candle}
+                else:
+                    # New red dot is lower — check for SHORT entry
                     gap = candle - state["last_green_candle"]
                     if gap > MIN_GAP and not state["in_trade"]:
                         state["in_trade"] = True
                         state["trade_side"] = "SHORT"
                         state["red_anchor"] = None
                         state["trades"].append({"time": datetime.utcnow().strftime("%Y-%m-%d %H:%M"), "side": "SHORT", "status": "OPEN"})
-                    if value >= ANCHOR_LEVEL:
-                        state["red_anchor"] = {"value": value, "candle": candle}
-                else:
-                    if value >= ANCHOR_LEVEL:
-                        state["red_anchor"] = {"value": value, "candle": candle}
-                    else:
-                        state["red_anchor"] = None
 
         return jsonify({"status": "ok"}), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
