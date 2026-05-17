@@ -56,7 +56,6 @@ def check_trade_close(current_price):
     tp = trade["tp"]
     sl = trade["sl"]
     side = trade["side"]
-    entry = trade["entry"]
     result = None
     if side == "LONG":
         if current_price >= tp:
@@ -72,20 +71,12 @@ def check_trade_close(current_price):
         trade["status"] = result
         trade["close_price"] = current_price
         trade["close_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-        if side == "LONG":
-            if result == "WIN":
-                pnl = state["balance"] * TP_PCT
-                state["wins"] += 1
-            else:
-                pnl = -state["balance"] * SL_PCT
-                state["losses"] += 1
-        elif side == "SHORT":
-            if result == "WIN":
-                pnl = state["balance"] * TP_PCT
-                state["wins"] += 1
-            else:
-                pnl = -state["balance"] * SL_PCT
-                state["losses"] += 1
+        if result == "WIN":
+            pnl = state["balance"] * TP_PCT
+            state["wins"] += 1
+        else:
+            pnl = -state["balance"] * SL_PCT
+            state["losses"] += 1
         state["balance"] += pnl
         trade["pnl"] = round(pnl, 2)
         state["in_trade"] = False
@@ -98,12 +89,17 @@ state = load_state()
 def webhook():
     try:
         data = request.get_json(force=True)
+        print(f"Received webhook: {data}")
+
         dot = data.get("dot")
-        value = float(data.get("value", 0))
+        raw = data.get("value", 0)
+        value = float(str(raw).replace('"', '').strip())
+
+        print(f"Dot: {dot}, Value: {value}")
+
         state["candle_count"] += 1
         candle = state["candle_count"]
 
-        # Check if open trade has hit TP or SL
         if state["in_trade"]:
             price = get_candle_close()
             if price:
@@ -115,9 +111,11 @@ def webhook():
             if anchor is None:
                 if value <= -ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value, "candle": candle}
+                    print(f"Green anchor set: {value}")
             else:
                 if value <= anchor["value"]:
                     state["green_anchor"] = {"value": value, "candle": candle}
+                    print(f"Green anchor updated: {value}")
                 else:
                     gap = candle - state["last_red_candle"]
                     if gap > MIN_GAP and not state["in_trade"]:
@@ -137,6 +135,7 @@ def webhook():
                                 "sl": sl,
                                 "pnl": None,
                             })
+                            print(f"LONG opened at {price} TP:{tp} SL:{sl}")
 
         elif dot == "red":
             state["last_red_candle"] = candle
@@ -144,9 +143,11 @@ def webhook():
             if anchor is None:
                 if value >= ANCHOR_LEVEL:
                     state["red_anchor"] = {"value": value, "candle": candle}
+                    print(f"Red anchor set: {value}")
             else:
                 if value >= anchor["value"]:
                     state["red_anchor"] = {"value": value, "candle": candle}
+                    print(f"Red anchor updated: {value}")
                 else:
                     gap = candle - state["last_green_candle"]
                     if gap > MIN_GAP and not state["in_trade"]:
@@ -166,11 +167,13 @@ def webhook():
                                 "sl": sl,
                                 "pnl": None,
                             })
+                            print(f"SHORT opened at {price} TP:{tp} SL:{sl}")
 
         save_state()
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
+        print(f"WEBHOOK ERROR: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
