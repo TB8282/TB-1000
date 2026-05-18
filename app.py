@@ -3,6 +3,8 @@ import os
 import threading
 import time
 import requests
+import psycopg2
+import json
 from datetime import datetime
 
 app = Flask(__name__)
@@ -14,6 +16,7 @@ TP_PCT = 0.0045
 SL_PCT = 0.0035
 FEE = 0.20
 STARTING_BALANCE = float(os.environ.get("STARTING_BALANCE", 500))
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 state = {
     "balance": STARTING_BALANCE,
@@ -33,6 +36,136 @@ state = {
 }
 
 state_lock = threading.Lock()
+
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id SERIAL PRIMARY KEY,
+                time TEXT,
+                side TEXT,
+                entry_price REAL,
+                tp_price REAL,
+                sl_price REAL,
+                potential_win REAL,
+                potential_loss REAL,
+                status TEXT,
+                exit_price REAL,
+                pnl REAL,
+                balance_after REAL
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("DB initialized")
+    except Exception as e:
+        print("DB init error: " + str(e))
+
+
+def save_balance(balance, wins, losses):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO bot_state (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    ("balance", str(balance)))
+        cur.execute("INSERT INTO bot_state (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    ("wins", str(wins)))
+        cur.execute("INSERT INTO bot_state (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    ("losses", str(losses)))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("DB save error: " + str(e))
+
+
+def load_balance():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM bot_state WHERE key IN ('balance', 'wins', 'losses')")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        data = {r[0]: r[1] for r in rows}
+        return (
+            float(data.get("balance", STARTING_BALANCE)),
+            int(data.get("wins", 0)),
+            int(data.get("losses", 0))
+        )
+    except Exception as e:
+        print("DB load error: " + str(e))
+        return STARTING_BALANCE, 0, 0
+
+
+def save_trade(t):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trades (time, side, entry_price, tp_price, sl_price, potential_win, potential_loss, status, exit_price, pnl, balance_after)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            t["time"], t["side"], t["entry_price"], t["tp_price"], t["sl_price"],
+            t.get("potential_win"), t.get("potential_loss"),
+            t["status"], t.get("exit_price"), t.get("pnl"), t.get("balance_after")
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("DB save trade error: " + str(e))
+
+
+def update_last_trade(status, exit_price, pnl, balance_after):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE trades SET status=%s, exit_price=%s, pnl=%s, balance_after=%s
+            WHERE id = (SELECT MAX(id) FROM trades)
+        """, (status, exit_price, pnl, balance_after))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("DB update trade error: " + str(e))
+
+
+def load_trades():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT time, side, entry_price, tp_price, sl_price, potential_win, potential_loss, status, exit_price, pnl, balance_after FROM trades ORDER BY id DESC LIMIT 100")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        trades = []
+        for r in rows:
+            trades.append({
+                "time": r[0], "side": r[1], "entry_price": r[2],
+                "tp_price": r[3], "sl_price": r[4], "potential_win": r[5],
+                "potential_loss": r[6], "status": r[7], "exit_price": r[8],
+                "pnl": r[9], "balance_after": r[10]
+            })
+        return list(reversed(trades))
+    except Exception as e:
+        print("DB load trades error: " + str(e))
+        return []
 
 
 def fmt(n):
@@ -87,6 +220,9 @@ def close_trade(result, exit_price):
                 t["balance_after"] = state["balance"]
                 break
 
+        update_last_trade(result, exit_price, pnl, state["balance"])
+        save_balance(state["balance"], state["wins"], state["losses"])
+
         state["in_trade"] = False
         state["trade_side"] = None
         state["entry_price"] = None
@@ -139,7 +275,7 @@ def open_trade(side, entry_price, candle_time):
     potential_win = round(balance * TP_PCT - FEE, 2)
     potential_loss = round(-(balance * SL_PCT) - FEE, 2)
 
-    state["trades"].append({
+    trade = {
         "time": candle_time,
         "side": side,
         "entry_price": entry_price,
@@ -151,7 +287,10 @@ def open_trade(side, entry_price, candle_time):
         "exit_price": None,
         "pnl": None,
         "balance_after": None,
-    })
+    }
+    state["trades"].append(trade)
+    save_trade(trade)
+
     print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} | SL: {sl} | Win: {fmt(potential_win)} | Loss: {fmt(potential_loss)}")
 
 
@@ -268,7 +407,8 @@ def webhook():
 @app.route("/", methods=["GET"])
 def dashboard():
     try:
-        recent = list(reversed(state["trades"][-10:]))
+        all_trades = load_trades()
+        recent = list(reversed(all_trades[-10:]))
         rows = ""
         for t in recent:
             status = t.get("status", "OPEN")
@@ -365,7 +505,16 @@ def reset():
 
 
 if __name__ == "__main__":
+    init_db()
+    balance, wins, losses = load_balance()
+    state["balance"] = balance
+    state["wins"] = wins
+    state["losses"] = losses
+    state["trades"] = load_trades()
+    print(f"Loaded from DB: Balance={fmt(balance)} Wins={wins} Losses={losses}")
+
     watcher = threading.Thread(target=price_watcher, daemon=True)
     watcher.start()
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
