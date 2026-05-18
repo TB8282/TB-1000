@@ -24,8 +24,6 @@ state = {
     "sl_price": None,
     "green_anchor": None,
     "red_anchor": None,
-    "last_red_candle": 0,
-    "last_green_candle": 0,
     "candle_count": 0,
     "trades": [],
     "wins": 0,
@@ -186,7 +184,6 @@ def webhook():
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
 
             if dot == "green":
-                state["last_green_candle"] = candle
                 anchor = state["green_anchor"]
 
                 if anchor is None:
@@ -194,33 +191,26 @@ def webhook():
                         state["green_anchor"] = {"value": value, "candle": candle}
                         print(f"GREEN anchor stored: {round(value, 2)}")
                     else:
-                        print(f"Green dot {round(value, 2)} not deep enough for anchor")
+                        print(f"Green dot {round(value, 2)} ignored - not deep enough")
                 else:
                     if value > anchor["value"]:
                         if value > TRIGGER_MAX_GREEN:
                             print(f"GREEN trigger too high ({round(value, 2)}) - anchor kept")
+                        elif state["in_trade"]:
+                            print("Already in trade - ignored")
                         else:
-                            prev_candle_was_red = (state["last_red_candle"] == candle - 1)
-                            if prev_candle_was_red:
-                                print(f"Gap rule blocked - red dot on previous candle")
-                                state["green_anchor"] = {"value": value, "candle": candle}
-                            elif state["in_trade"]:
-                                print("Already in trade - ignored")
-                            else:
-                                print(f"VALID LONG! Anchor: {round(anchor['value'], 2)} Trigger: {round(value, 2)}")
-                                open_trade("LONG", close_price, now)
-                                state["green_anchor"] = None
-                                state["red_anchor"] = None
+                            print(f"VALID LONG! Anchor: {round(anchor['value'], 2)} Trigger: {round(value, 2)}")
+                            open_trade("LONG", close_price, now)
+                            state["green_anchor"] = None
+                            state["red_anchor"] = None
                     else:
                         if value <= -ANCHOR_LEVEL:
                             state["green_anchor"] = {"value": value, "candle": candle}
                             print(f"NEW GREEN anchor: {round(value, 2)}")
                         else:
-                            state["green_anchor"] = None
-                            print("GREEN anchor cleared")
+                            print(f"Green dot {round(value, 2)} ignored - anchor kept at {round(anchor['value'], 2)}")
 
             elif dot == "red":
-                state["last_red_candle"] = candle
                 anchor = state["red_anchor"]
 
                 if anchor is None:
@@ -228,30 +218,24 @@ def webhook():
                         state["red_anchor"] = {"value": value, "candle": candle}
                         print(f"RED anchor stored: {round(value, 2)}")
                     else:
-                        print(f"Red dot {round(value, 2)} not high enough for anchor")
+                        print(f"Red dot {round(value, 2)} ignored - not high enough")
                 else:
                     if value < anchor["value"]:
                         if value < TRIGGER_MIN_RED:
                             print(f"RED trigger too low ({round(value, 2)}) - anchor kept")
+                        elif state["in_trade"]:
+                            print("Already in trade - ignored")
                         else:
-                            prev_candle_was_green = (state["last_green_candle"] == candle - 1)
-                            if prev_candle_was_green:
-                                print(f"Gap rule blocked - green dot on previous candle")
-                                state["red_anchor"] = {"value": value, "candle": candle}
-                            elif state["in_trade"]:
-                                print("Already in trade - ignored")
-                            else:
-                                print(f"VALID SHORT! Anchor: {round(anchor['value'], 2)} Trigger: {round(value, 2)}")
-                                open_trade("SHORT", close_price, now)
-                                state["red_anchor"] = None
-                                state["green_anchor"] = None
+                            print(f"VALID SHORT! Anchor: {round(anchor['value'], 2)} Trigger: {round(value, 2)}")
+                            open_trade("SHORT", close_price, now)
+                            state["red_anchor"] = None
+                            state["green_anchor"] = None
                     else:
                         if value >= ANCHOR_LEVEL:
                             state["red_anchor"] = {"value": value, "candle": candle}
                             print(f"NEW RED anchor: {round(value, 2)}")
                         else:
-                            state["red_anchor"] = None
-                            print("RED anchor cleared")
+                            print(f"Red dot {round(value, 2)} ignored - anchor kept at {round(anchor['value'], 2)}")
 
             else:
                 print("Unknown dot type: " + dot)
