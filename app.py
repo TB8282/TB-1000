@@ -8,10 +8,11 @@ from datetime import datetime
 app = Flask(__name__)
 
 ANCHOR_LEVEL = 30
-TRIGGER_MAX_GREEN = 5      # green trigger must be <= +5
-TRIGGER_MIN_RED = -5       # red trigger must be >= -5
-TP_PCT = 0.0045            # 0.45%
-SL_PCT = 0.0035            # 0.35%
+TRIGGER_MAX_GREEN = 5
+TRIGGER_MIN_RED = -5
+TP_PCT = 0.0045
+SL_PCT = 0.0035
+FEE = 0.20
 STARTING_BALANCE = float(os.environ.get("STARTING_BALANCE", 500))
 
 state = {
@@ -29,7 +30,6 @@ state = {
     "trades": [],
     "wins": 0,
     "losses": 0,
-    "ties": 0,
 }
 
 state_lock = threading.Lock()
@@ -66,21 +66,24 @@ def close_trade(result, exit_price):
         balance = state["balance"]
 
         if result == "WIN":
-            pnl_pct = TP_PCT if side == "LONG" else TP_PCT
-            state["balance"] = round(balance * (1 + pnl_pct), 2)
+            pnl = round(balance * TP_PCT - FEE, 2)
+        else:
+            pnl = round(-(balance * SL_PCT) - FEE, 2)
+
+        state["balance"] = round(balance + pnl, 2)
+
+        if result == "WIN":
             state["wins"] += 1
         else:
-            pnl_pct = SL_PCT
-            state["balance"] = round(balance * (1 - pnl_pct), 2)
             state["losses"] += 1
 
-        print(f"TRADE CLOSED: {result} | Side: {side} | Entry: {entry} | Exit: {exit_price} | Balance: {state['balance']}")
+        print(f"TRADE CLOSED: {result} | Side: {side} | Entry: {entry} | Exit: {exit_price} | PnL: {fmt(pnl)} | Balance: {fmt(state['balance'])}")
 
-        # Update last trade record
         for t in reversed(state["trades"]):
             if t["status"] == "OPEN":
                 t["status"] = result
                 t["exit_price"] = exit_price
+                t["pnl"] = pnl
                 t["balance_after"] = state["balance"]
                 break
 
@@ -118,6 +121,8 @@ def price_watcher():
 
 
 def open_trade(side, entry_price, candle_time):
+    balance = state["balance"]
+
     if side == "LONG":
         tp = round(entry_price * (1 + TP_PCT), 2)
         sl = round(entry_price * (1 - SL_PCT), 2)
@@ -130,17 +135,24 @@ def open_trade(side, entry_price, candle_time):
     state["entry_price"] = entry_price
     state["tp_price"] = tp
     state["sl_price"] = sl
+
+    potential_win = round(balance * TP_PCT - FEE, 2)
+    potential_loss = round(-(balance * SL_PCT) - FEE, 2)
+
     state["trades"].append({
         "time": candle_time,
         "side": side,
         "entry_price": entry_price,
         "tp_price": tp,
         "sl_price": sl,
+        "potential_win": potential_win,
+        "potential_loss": potential_loss,
         "status": "OPEN",
         "exit_price": None,
+        "pnl": None,
         "balance_after": None,
     })
-    print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} | SL: {sl}")
+    print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} | SL: {sl} | Win: {fmt(potential_win)} | Loss: {fmt(potential_loss)}")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -155,18 +167,15 @@ def webhook():
             return jsonify({"error": "invalid json"}), 400
 
         dot = str(data.get("dot", "")).lower().strip()
-        raw_value = data.get("value", 0)
-        raw_close = data.get("close", None)
-
-        value = safe_float(raw_value)
-        close_price = safe_float(raw_close)
+        value = safe_float(data.get("value", 0))
+        close_price = safe_float(data.get("close", None))
 
         if value is None:
-            print("ERROR: invalid value: " + str(raw_value))
+            print("ERROR: invalid value")
             return jsonify({"error": "invalid value"}), 400
 
         if close_price is None:
-            print("ERROR: missing or invalid close price")
+            print("ERROR: missing close price")
             return jsonify({"error": "invalid close"}), 400
 
         print(f"Dot: {dot} | Value: {round(value, 2)} | Close: {close_price}")
@@ -189,7 +198,6 @@ def webhook():
                 else:
                     if value > anchor["value"]:
                         if value > TRIGGER_MAX_GREEN:
-                            # Too high — keep anchor, wait for it to come back down
                             print(f"GREEN trigger too high ({round(value, 2)}) - anchor kept")
                         else:
                             prev_candle_was_red = (state["last_red_candle"] == candle - 1)
@@ -202,9 +210,8 @@ def webhook():
                                 print(f"VALID LONG! Anchor: {round(anchor['value'], 2)} Trigger: {round(value, 2)}")
                                 open_trade("LONG", close_price, now)
                                 state["green_anchor"] = None
-                                state["red_anchor"] = None  # clear opposite anchor
+                                state["red_anchor"] = None
                     else:
-                        # Dot is lower than anchor — update anchor if deep enough
                         if value <= -ANCHOR_LEVEL:
                             state["green_anchor"] = {"value": value, "candle": candle}
                             print(f"NEW GREEN anchor: {round(value, 2)}")
@@ -225,7 +232,6 @@ def webhook():
                 else:
                     if value < anchor["value"]:
                         if value < TRIGGER_MIN_RED:
-                            # Too low — keep anchor, wait for it to come back up
                             print(f"RED trigger too low ({round(value, 2)}) - anchor kept")
                         else:
                             prev_candle_was_green = (state["last_green_candle"] == candle - 1)
@@ -238,7 +244,7 @@ def webhook():
                                 print(f"VALID SHORT! Anchor: {round(anchor['value'], 2)} Trigger: {round(value, 2)}")
                                 open_trade("SHORT", close_price, now)
                                 state["red_anchor"] = None
-                                state["green_anchor"] = None  # clear opposite anchor
+                                state["green_anchor"] = None
                     else:
                         if value >= ANCHOR_LEVEL:
                             state["red_anchor"] = {"value": value, "candle": candle}
@@ -270,6 +276,8 @@ def dashboard():
             entry = fmt(t.get("entry_price", 0))
             tp = fmt(t.get("tp_price", 0))
             sl = fmt(t.get("sl_price", 0))
+            pnl = fmt(t.get("pnl", 0)) if t.get("pnl") is not None else "-"
+            bal = fmt(t.get("balance_after", 0)) if t.get("balance_after") is not None else "-"
             rows += (
                 "<tr>"
                 "<td>" + t["time"] + "</td>"
@@ -278,16 +286,21 @@ def dashboard():
                 "<td style='color:#00ff88'>" + tp + "</td>"
                 "<td style='color:red'>" + sl + "</td>"
                 "<td style='color:" + color + "'>" + status + "</td>"
+                "<td>" + pnl + "</td>"
+                "<td>" + bal + "</td>"
                 "</tr>"
             )
         if not rows:
-            rows = "<tr><td colspan='6' style='color:#555'>Waiting for signals...</td></tr>"
+            rows = "<tr><td colspan='8' style='color:#555'>Waiting for signals...</td></tr>"
 
         green = str(round(state["green_anchor"]["value"], 1)) if state["green_anchor"] else "None"
         red = str(round(state["red_anchor"]["value"], 1)) if state["red_anchor"] else "None"
         trade = "YES - " + str(state["trade_side"]) if state["in_trade"] else "No"
         tp_display = fmt(state["tp_price"]) if state["tp_price"] else "-"
         sl_display = fmt(state["sl_price"]) if state["sl_price"] else "-"
+
+        total_trades = state["wins"] + state["losses"]
+        win_rate = str(round(state["wins"] / total_trades * 100)) + "%" if total_trades > 0 else "-"
 
         html = (
             "<!DOCTYPE html><html><head><title>TB-1000</title>"
@@ -308,6 +321,7 @@ def dashboard():
             "<div class='c'><div class='l'>Balance</div><div class='v'>" + fmt(state["balance"]) + "</div></div>"
             "<div class='c'><div class='l'>Wins</div><div class='v'>" + str(state["wins"]) + "</div></div>"
             "<div class='c'><div class='l'>Losses</div><div class='v'>" + str(state["losses"]) + "</div></div>"
+            "<div class='c'><div class='l'>Win Rate</div><div class='v'>" + win_rate + "</div></div>"
             "<div class='c'><div class='l'>In Trade</div><div class='v'>" + trade + "</div></div>"
             "<div class='c'><div class='l'>Live TP</div><div class='v'>" + tp_display + "</div></div>"
             "<div class='c'><div class='l'>Live SL</div><div class='v'>" + sl_display + "</div></div>"
@@ -315,7 +329,7 @@ def dashboard():
             "<div class='c'><div class='l'>Red Anchor</div><div class='v'>" + red + "</div></div>"
             "<div class='c'><div class='l'>Candles Seen</div><div class='v'>" + str(state["candle_count"]) + "</div></div>"
             "</div>"
-            "<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Status</th></tr>"
+            "<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Status</th><th>PnL</th><th>Balance</th></tr>"
             + rows +
             "</table>"
             "<p style='color:#555;font-size:11px;margin-top:1rem'>Auto-refreshes every 10 seconds</p>"
