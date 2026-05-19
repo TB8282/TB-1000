@@ -50,8 +50,10 @@ def safe_float(val):
 def get_btc_price():
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3)
-        return float(r.json()["price"])
-    except:
+        price = float(r.json()["price"])
+        return price
+    except Exception as e:
+        print(f"Binance price error: {str(e)}")
         return None
 
 
@@ -93,6 +95,7 @@ def close_trade(result, exit_price):
 
 
 def price_watcher():
+    print("Price watcher started")
     while True:
         time.sleep(1)
         with state_lock:
@@ -104,7 +107,10 @@ def price_watcher():
 
         price = get_btc_price()
         if price is None:
+            print("Price watcher: could not get BTC price")
             continue
+
+        print(f"Price watcher: {price} | TP: {tp} | SL: {sl}")
 
         if side == "LONG":
             if price >= tp:
