@@ -11,7 +11,7 @@ ANCHOR_LEVEL = 30
 TRIGGER_MAX_GREEN = 5
 TRIGGER_MIN_RED = -5
 TP_PCT = 0.0045
-SL_PCT = 0.0035
+SL_PCT = 0.0025
 FEE = 0.20
 STARTING_BALANCE = float(os.environ.get("STARTING_BALANCE", 500))
 
@@ -49,11 +49,11 @@ def safe_float(val):
 
 def get_btc_price():
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3)
+        r = requests.get("https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT", timeout=3)
         price = float(r.json()["price"])
         return price
     except Exception as e:
-        print(f"Binance price error: {str(e)}")
+        print(f"Price error: {str(e)}")
         return None
 
 
