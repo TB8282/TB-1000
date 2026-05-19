@@ -49,8 +49,8 @@ def safe_float(val):
 
 def get_btc_price():
     try:
-        r = requests.get("https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT", timeout=3)
-        price = float(r.json()["price"])
+        r = requests.get("https://api.crypto.com/v2/public/get-ticker?instrument_name=BTC_USDT", timeout=3)
+        price = float(r.json()["result"]["data"][0]["a"])
         return price
     except Exception as e:
         print(f"Price error: {str(e)}")
