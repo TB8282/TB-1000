@@ -354,8 +354,10 @@ def reset():
     return jsonify({"status": "reset ok"}), 200
 
 
+# Start price watcher when app loads — works with gunicorn
+watcher = threading.Thread(target=price_watcher, daemon=True)
+watcher.start()
+
 if __name__ == "__main__":
-    watcher = threading.Thread(target=price_watcher, daemon=True)
-    watcher.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
