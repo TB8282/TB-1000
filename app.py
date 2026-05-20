@@ -12,7 +12,7 @@ TRIGGER_MAX_GREEN = 5
 TRIGGER_MIN_RED = -5
 TP_PCT = 0.0045
 SL_PCT = 0.0025
-FEE = 0.20
+FEE_PCT = 0.0002
 STARTING_BALANCE = float(os.environ.get("STARTING_BALANCE", 500))
 
 state = {
@@ -64,11 +64,12 @@ def close_trade(result, exit_price):
         side = state["trade_side"]
         entry = state["entry_price"]
         balance = state["balance"]
+        fee = round(balance * FEE_PCT, 2)
 
         if result == "WIN":
-            pnl = round(balance * TP_PCT - FEE, 2)
+            pnl = round(balance * TP_PCT - fee, 2)
         else:
-            pnl = round(-(balance * SL_PCT) - FEE, 2)
+            pnl = round(-(balance * SL_PCT) - fee, 2)
 
         state["balance"] = round(balance + pnl, 2)
 
@@ -96,19 +97,26 @@ def close_trade(result, exit_price):
 
 def price_watcher():
     print("Price watcher started")
+    check_count = 0
     while True:
         time.sleep(1)
+        check_count += 1
+
+        price = get_btc_price()
+        if price is None:
+            print("Price watcher: could not get BTC price")
+            continue
+
+        # Log every 30 seconds so we can confirm it's working
+        if check_count % 30 == 0:
+            print(f"Price watcher alive: ${price}")
+
         with state_lock:
             if not state["in_trade"]:
                 continue
             tp = state["tp_price"]
             sl = state["sl_price"]
             side = state["trade_side"]
-
-        price = get_btc_price()
-        if price is None:
-            print("Price watcher: could not get BTC price")
-            continue
 
         print(f"Price watcher: {price} | TP: {tp} | SL: {sl}")
 
@@ -126,6 +134,7 @@ def price_watcher():
 
 def open_trade(side, entry_price, candle_time):
     balance = state["balance"]
+    fee = round(balance * FEE_PCT, 2)
 
     if side == "LONG":
         tp = round(entry_price * (1 + TP_PCT), 2)
@@ -140,8 +149,8 @@ def open_trade(side, entry_price, candle_time):
     state["tp_price"] = tp
     state["sl_price"] = sl
 
-    potential_win = round(balance * TP_PCT - FEE, 2)
-    potential_loss = round(-(balance * SL_PCT) - FEE, 2)
+    potential_win = round(balance * TP_PCT - fee, 2)
+    potential_loss = round(-(balance * SL_PCT) - fee, 2)
 
     state["trades"].append({
         "time": candle_time,
