@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import os
 import threading
-import time
 import requests
 import psycopg2
 from datetime import datetime
@@ -144,21 +143,6 @@ def save_trade(t):
         print(f"DB save trade error: {str(e)}")
 
 
-def update_last_trade(status, exit_price, pnl, balance_after):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE trades SET status=%s, exit_price=%s, pnl=%s, balance_after=%s
-            WHERE id = (SELECT MAX(id) FROM trades)
-        """, (status, exit_price, pnl, balance_after))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB update trade error: {str(e)}")
-
-
 def load_trades():
     try:
         conn = get_db()
@@ -181,108 +165,6 @@ def load_trades():
     except Exception as e:
         print(f"DB load trades error: {str(e)}")
         return []
-
-
-def get_btc_price():
-    try:
-        r = requests.get("https://api.crypto.com/v2/public/get-ticker?instrument_name=BTC_USDT", timeout=3)
-        price = float(r.json()["result"]["data"][0]["a"])
-        return price
-    except Exception as e:
-        print(f"Price error: {str(e)}")
-        return None
-
-
-def close_trade(result, exit_price):
-    with state_lock:
-        if not state["in_trade"]:
-            return
-        side = state["trade_side"]
-        entry = state["entry_price"]
-        balance = state["balance"]
-        fee = round(balance * FEE_PCT, 2)
-
-        if result == "WIN":
-            pnl = round(balance * TP_PCT - fee, 2)
-        else:
-            pnl = round(-(balance * SL_PCT) - fee, 2)
-
-        state["balance"] = round(balance + pnl, 2)
-
-        if result == "WIN":
-            state["wins"] += 1
-        else:
-            state["losses"] += 1
-
-        print(f"TRADE CLOSED: {result} | Side: {side} | Entry: {entry} | Exit: {exit_price} | PnL: {fmt(pnl)} | Balance: {fmt(state['balance'])}")
-
-        for t in reversed(state["trades"]):
-            if t["status"] == "OPEN":
-                t["status"] = result
-                t["exit_price"] = exit_price
-                t["pnl"] = pnl
-                t["balance_after"] = state["balance"]
-                break
-
-        update_last_trade(result, exit_price, pnl, state["balance"])
-
-        state["in_trade"] = False
-        state["trade_side"] = None
-        state["entry_price"] = None
-        state["tp_price"] = None
-        state["sl_price"] = None
-
-        save_state()
-
-
-def price_watcher_loop():
-    check_count = 0
-    while True:
-        try:
-            time.sleep(1)
-            check_count += 1
-
-            price = get_btc_price()
-
-            if check_count % 30 == 0:
-                print(f"Price watcher check #{check_count} | price: {price}")
-
-            if price is None:
-                continue
-
-            with state_lock:
-                if not state["in_trade"]:
-                    continue
-                tp = state["tp_price"]
-                sl = state["sl_price"]
-                side = state["trade_side"]
-
-            print(f"Price watcher: {price} | TP: {tp} | SL: {sl}")
-
-            if side == "LONG":
-                if price >= tp:
-                    close_trade("WIN", price)
-                elif price <= sl:
-                    close_trade("LOSS", price)
-            elif side == "SHORT":
-                if price <= tp:
-                    close_trade("WIN", price)
-                elif price >= sl:
-                    close_trade("LOSS", price)
-
-        except Exception as e:
-            print(f"Price watcher loop error: {str(e)}")
-            time.sleep(5)
-
-
-def price_watcher():
-    while True:
-        try:
-            print("Price watcher started")
-            price_watcher_loop()
-        except Exception as e:
-            print(f"Price watcher crashed: {str(e)} - restarting in 5 seconds")
-            time.sleep(5)
 
 
 def open_trade(side, entry_price, candle_time):
@@ -522,15 +404,4 @@ def reset():
     return jsonify({"status": "reset ok"}), 200
 
 
-# Initialize DB and load state on startup
-init_db()
-load_state()
-state["trades"] = load_trades()
-
-# Start price watcher
-watcher = threading.Thread(target=price_watcher, daemon=True)
-watcher.start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# Initia
