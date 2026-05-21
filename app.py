@@ -103,11 +103,13 @@ def price_watcher_loop():
             check_count += 1
 
             price = get_btc_price()
+
+            # Log every 30 seconds regardless of price result
+            if check_count % 30 == 0:
+                print(f"Price watcher check #{check_count} | price: {price}")
+
             if price is None:
                 continue
-
-            if check_count % 30 == 0:
-                print(f"Price watcher alive: ${price}")
 
             with state_lock:
                 if not state["in_trade"]:
@@ -130,7 +132,7 @@ def price_watcher_loop():
                     close_trade("LOSS", price)
 
         except Exception as e:
-            print(f"Price watcher error: {str(e)} - restarting in 5 seconds")
+            print(f"Price watcher loop error: {str(e)}")
             time.sleep(5)
 
 
