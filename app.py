@@ -95,41 +95,53 @@ def close_trade(result, exit_price):
         state["sl_price"] = None
 
 
-def price_watcher():
-    print("Price watcher started")
+def price_watcher_loop():
     check_count = 0
     while True:
-        time.sleep(1)
-        check_count += 1
+        try:
+            time.sleep(1)
+            check_count += 1
 
-        price = get_btc_price()
-        if price is None:
-            print("Price watcher: could not get BTC price")
-            continue
-
-        # Log every 30 seconds so we can confirm it's working
-        if check_count % 30 == 0:
-            print(f"Price watcher alive: ${price}")
-
-        with state_lock:
-            if not state["in_trade"]:
+            price = get_btc_price()
+            if price is None:
                 continue
-            tp = state["tp_price"]
-            sl = state["sl_price"]
-            side = state["trade_side"]
 
-        print(f"Price watcher: {price} | TP: {tp} | SL: {sl}")
+            if check_count % 30 == 0:
+                print(f"Price watcher alive: ${price}")
 
-        if side == "LONG":
-            if price >= tp:
-                close_trade("WIN", price)
-            elif price <= sl:
-                close_trade("LOSS", price)
-        elif side == "SHORT":
-            if price <= tp:
-                close_trade("WIN", price)
-            elif price >= sl:
-                close_trade("LOSS", price)
+            with state_lock:
+                if not state["in_trade"]:
+                    continue
+                tp = state["tp_price"]
+                sl = state["sl_price"]
+                side = state["trade_side"]
+
+            print(f"Price watcher: {price} | TP: {tp} | SL: {sl}")
+
+            if side == "LONG":
+                if price >= tp:
+                    close_trade("WIN", price)
+                elif price <= sl:
+                    close_trade("LOSS", price)
+            elif side == "SHORT":
+                if price <= tp:
+                    close_trade("WIN", price)
+                elif price >= sl:
+                    close_trade("LOSS", price)
+
+        except Exception as e:
+            print(f"Price watcher error: {str(e)} - restarting in 5 seconds")
+            time.sleep(5)
+
+
+def price_watcher():
+    while True:
+        try:
+            print("Price watcher started")
+            price_watcher_loop()
+        except Exception as e:
+            print(f"Price watcher crashed: {str(e)} - restarting in 5 seconds")
+            time.sleep(5)
 
 
 def open_trade(side, entry_price, candle_time):
@@ -363,7 +375,7 @@ def reset():
     return jsonify({"status": "reset ok"}), 200
 
 
-# Start price watcher when app loads — works with gunicorn
+# Start price watcher — restarts itself if it ever dies
 watcher = threading.Thread(target=price_watcher, daemon=True)
 watcher.start()
 
