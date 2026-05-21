@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import requests
+import psycopg2
 from datetime import datetime
 
 app = Flask(__name__)
@@ -11,9 +12,10 @@ ANCHOR_LEVEL = 30
 TRIGGER_MAX_GREEN = 5
 TRIGGER_MIN_RED = -5
 TP_PCT = 0.0045
-SL_PCT = 0.0025
+SL_PCT = 0.0035
 FEE_PCT = 0.0002
 STARTING_BALANCE = float(os.environ.get("STARTING_BALANCE", 500))
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 state = {
     "balance": STARTING_BALANCE,
@@ -45,6 +47,140 @@ def safe_float(val):
         return float(val)
     except:
         return None
+
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id SERIAL PRIMARY KEY,
+                time TEXT,
+                side TEXT,
+                entry_price REAL,
+                tp_price REAL,
+                sl_price REAL,
+                status TEXT,
+                exit_price REAL,
+                pnl REAL,
+                balance_after REAL
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("DB initialized")
+    except Exception as e:
+        print(f"DB init error: {str(e)}")
+
+
+def save_state():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        fields = ["balance", "wins", "losses", "in_trade", "trade_side",
+                  "entry_price", "tp_price", "sl_price"]
+        for key in fields:
+            val = state.get(key)
+            cur.execute("""
+                INSERT INTO bot_state (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (key, str(val)))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"DB save error: {str(e)}")
+
+
+def load_state():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM bot_state")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        data = {r[0]: r[1] for r in rows}
+
+        if data:
+            state["balance"] = float(data.get("balance", STARTING_BALANCE))
+            state["wins"] = int(data.get("wins", 0))
+            state["losses"] = int(data.get("losses", 0))
+            state["in_trade"] = data.get("in_trade") == "True"
+            state["trade_side"] = data.get("trade_side") if data.get("trade_side") != "None" else None
+            state["entry_price"] = float(data["entry_price"]) if data.get("entry_price") not in [None, "None"] else None
+            state["tp_price"] = float(data["tp_price"]) if data.get("tp_price") not in [None, "None"] else None
+            state["sl_price"] = float(data["sl_price"]) if data.get("sl_price") not in [None, "None"] else None
+            print(f"State loaded: Balance={fmt(state['balance'])} | In trade={state['in_trade']} | Side={state['trade_side']}")
+    except Exception as e:
+        print(f"DB load error: {str(e)}")
+
+
+def save_trade(t):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trades (time, side, entry_price, tp_price, sl_price, status, exit_price, pnl, balance_after)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (t["time"], t["side"], t["entry_price"], t["tp_price"], t["sl_price"],
+              t["status"], t.get("exit_price"), t.get("pnl"), t.get("balance_after")))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"DB save trade error: {str(e)}")
+
+
+def update_last_trade(status, exit_price, pnl, balance_after):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE trades SET status=%s, exit_price=%s, pnl=%s, balance_after=%s
+            WHERE id = (SELECT MAX(id) FROM trades)
+        """, (status, exit_price, pnl, balance_after))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"DB update trade error: {str(e)}")
+
+
+def load_trades():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT time, side, entry_price, tp_price, sl_price, status, exit_price, pnl, balance_after
+            FROM trades ORDER BY id DESC LIMIT 100
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        trades = []
+        for r in rows:
+            trades.append({
+                "time": r[0], "side": r[1], "entry_price": r[2],
+                "tp_price": r[3], "sl_price": r[4], "status": r[5],
+                "exit_price": r[6], "pnl": r[7], "balance_after": r[8]
+            })
+        return list(reversed(trades))
+    except Exception as e:
+        print(f"DB load trades error: {str(e)}")
+        return []
 
 
 def get_btc_price():
@@ -88,11 +224,15 @@ def close_trade(result, exit_price):
                 t["balance_after"] = state["balance"]
                 break
 
+        update_last_trade(result, exit_price, pnl, state["balance"])
+
         state["in_trade"] = False
         state["trade_side"] = None
         state["entry_price"] = None
         state["tp_price"] = None
         state["sl_price"] = None
+
+        save_state()
 
 
 def price_watcher_loop():
@@ -104,7 +244,6 @@ def price_watcher_loop():
 
             price = get_btc_price()
 
-            # Log every 30 seconds regardless of price result
             if check_count % 30 == 0:
                 print(f"Price watcher check #{check_count} | price: {price}")
 
@@ -166,7 +305,7 @@ def open_trade(side, entry_price, candle_time):
     potential_win = round(balance * TP_PCT - fee, 2)
     potential_loss = round(-(balance * SL_PCT) - fee, 2)
 
-    state["trades"].append({
+    trade = {
         "time": candle_time,
         "side": side,
         "entry_price": entry_price,
@@ -178,7 +317,11 @@ def open_trade(side, entry_price, candle_time):
         "exit_price": None,
         "pnl": None,
         "balance_after": None,
-    })
+    }
+    state["trades"].append(trade)
+    save_trade(trade)
+    save_state()
+
     print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} | SL: {sl} | Win: {fmt(potential_win)} | Loss: {fmt(potential_loss)}")
 
 
@@ -281,7 +424,8 @@ def webhook():
 @app.route("/", methods=["GET"])
 def dashboard():
     try:
-        recent = list(reversed(state["trades"][-10:]))
+        all_trades = load_trades()
+        recent = list(reversed(all_trades[-10:]))
         rows = ""
         for t in recent:
             status = t.get("status", "OPEN")
@@ -373,11 +517,17 @@ def reset():
         state["sl_price"] = None
         state["green_anchor"] = None
         state["red_anchor"] = None
+    save_state()
     print("State reset by user")
     return jsonify({"status": "reset ok"}), 200
 
 
-# Start price watcher — restarts itself if it ever dies
+# Initialize DB and load state on startup
+init_db()
+load_state()
+state["trades"] = load_trades()
+
+# Start price watcher
 watcher = threading.Thread(target=price_watcher, daemon=True)
 watcher.start()
 
