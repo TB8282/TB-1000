@@ -4,6 +4,7 @@ import threading
 import requests
 import psycopg2
 from datetime import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -207,6 +208,98 @@ def open_trade(side, entry_price, candle_time):
     print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} | SL: {sl} | Win: {fmt(potential_win)} | Loss: {fmt(potential_loss)}")
 
 
+def close_trade(status, exit_price):
+    with state_lock:
+        balance = state["balance"]
+        fee = round(balance * FEE_PCT, 2)
+        side = state["trade_side"]
+
+        if side == "LONG":
+            pnl = round(balance * TP_PCT - fee, 2) if status == "WIN" else round(-(balance * SL_PCT) - fee, 2)
+        else:
+            pnl = round(balance * TP_PCT - fee, 2) if status == "WIN" else round(-(balance * SL_PCT) - fee, 2)
+
+        new_balance = round(balance + pnl, 2)
+        state["balance"] = new_balance
+
+        if status == "WIN":
+            state["wins"] += 1
+        else:
+            state["losses"] += 1
+
+        state["in_trade"] = False
+        state["trade_side"] = None
+        state["entry_price"] = None
+        state["tp_price"] = None
+        state["sl_price"] = None
+
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+
+        # Update last open trade in DB
+        try:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trades SET status=%s, exit_price=%s, pnl=%s, balance_after=%s
+                WHERE id = (SELECT id FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1)
+            """, (status, exit_price, pnl, new_balance))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"DB close trade error: {str(e)}")
+
+        save_state()
+        print(f"TRADE CLOSED: {status} | Exit: {exit_price} | PnL: {fmt(pnl)} | New Balance: {fmt(new_balance)}")
+
+
+def get_btc_price():
+    try:
+        url = "https://api.crypto.com/v2/public/get-ticker?instrument_name=BTC_USDT"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        price = float(data["result"]["data"]["a"])
+        return price
+    except Exception as e:
+        print(f"Price fetch error: {str(e)}")
+        return None
+
+
+def check_price():
+    try:
+        if not state["in_trade"]:
+            return
+
+        price = get_btc_price()
+        if price is None:
+            return
+
+        tp = state["tp_price"]
+        sl = state["sl_price"]
+        side = state["trade_side"]
+
+        print(f"Price watcher check | Price: {price} | TP: {tp} | SL: {sl} | Side: {side}")
+
+        if side == "LONG":
+            if price >= tp:
+                print(f"TP HIT (LONG) at {price}")
+                close_trade("WIN", price)
+            elif price <= sl:
+                print(f"SL HIT (LONG) at {price}")
+                close_trade("LOSS", price)
+
+        elif side == "SHORT":
+            if price <= tp:
+                print(f"TP HIT (SHORT) at {price}")
+                close_trade("WIN", price)
+            elif price >= sl:
+                print(f"SL HIT (SHORT) at {price}")
+                close_trade("LOSS", price)
+
+    except Exception as e:
+        print(f"check_price error: {str(e)}")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -404,4 +497,11 @@ def reset():
     return jsonify({"status": "reset ok"}), 200
 
 
-# Initia
+# Initialize and start
+init_db()
+load_state()
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(check_price, "interval", seconds=30)
+scheduler.start()
+print("Price watcher started (APScheduler, every 30s)")
