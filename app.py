@@ -258,7 +258,7 @@ def get_btc_price():
         url = "https://api.crypto.com/v2/public/get-ticker?instrument_name=BTC_USDT"
         resp = requests.get(url, timeout=10)
         data = resp.json()
-        price = float(data["result"]["data"]["a"])
+        price = float(data["result"]["data"][0]["a"])
         return price
     except Exception as e:
         print(f"Price fetch error: {str(e)}")
