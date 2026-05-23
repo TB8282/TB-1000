@@ -399,6 +399,7 @@ def webhook():
 @app.route("/", methods=["GET"])
 def dashboard():
     try:
+        load_state()
         all_trades = load_trades()
         recent = list(reversed(all_trades[-10:]))
         rows = ""
