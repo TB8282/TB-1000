@@ -502,7 +502,16 @@ def reset():
 init_db()
 load_state()
 
-scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(check_price, "interval", seconds=30)
-scheduler.start()
-print("Price watcher started (APScheduler, every 30s)")
+scheduler = None
+
+def start_scheduler():
+    global scheduler
+    if scheduler is None or not scheduler.running:
+        scheduler = BackgroundScheduler(daemon=True)
+        scheduler.add_job(check_price, "interval", seconds=30)
+        scheduler.start()
+        print("Price watcher started (APScheduler, every 30s)")
+
+import atexit
+start_scheduler()
+atexit.register(lambda: scheduler.shutdown() if scheduler and scheduler.running else None)
