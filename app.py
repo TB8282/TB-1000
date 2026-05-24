@@ -502,7 +502,7 @@ def reset():
 init_db()
 load_state()
 
-scheduler = BackgroundScheduler()
+scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(check_price, "interval", seconds=30)
 scheduler.start()
 print("Price watcher started (APScheduler, every 30s)")
