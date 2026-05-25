@@ -504,3 +504,6 @@ load_state()
 watcher_thread = threading.Thread(target=price_watcher_loop, daemon=False)
 watcher_thread.start()
 print("Price watcher started (thread, every 30s)")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
