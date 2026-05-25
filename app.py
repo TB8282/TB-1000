@@ -264,19 +264,26 @@ def get_btc_price():
         print(f"Price fetch error: {str(e)}")
         return None
 
-
 def check_price():
     try:
-        if not state["in_trade"]:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM bot_state")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        data = {r[0]: r[1] for r in rows}
+
+        if data.get("in_trade") != "True":
             return
+
+        tp = float(data["tp_price"])
+        sl = float(data["sl_price"])
+        side = data["trade_side"]
 
         price = get_btc_price()
         if price is None:
             return
-
-        tp = state["tp_price"]
-        sl = state["sl_price"]
-        side = state["trade_side"]
 
         print(f"Price watcher check | Price: {price} | TP: {tp} | SL: {sl} | Side: {side}")
 
@@ -298,7 +305,6 @@ def check_price():
 
     except Exception as e:
         print(f"check_price error: {str(e)}")
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
