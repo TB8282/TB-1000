@@ -1,10 +1,10 @@
 from flask import Flask, request, jsonify
 import os
 import threading
+import time
 import requests
 import psycopg2
 from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -113,7 +113,6 @@ def load_state():
         cur.close()
         conn.close()
         data = {r[0]: r[1] for r in rows}
-
         if data:
             state["balance"] = float(data.get("balance", STARTING_BALANCE))
             state["wins"] = int(data.get("wins", 0))
@@ -171,23 +170,19 @@ def load_trades():
 def open_trade(side, entry_price, candle_time):
     balance = state["balance"]
     fee = round(balance * FEE_PCT, 2)
-
     if side == "LONG":
         tp = round(entry_price * (1 + TP_PCT), 2)
         sl = round(entry_price * (1 - SL_PCT), 2)
     else:
         tp = round(entry_price * (1 - TP_PCT), 2)
         sl = round(entry_price * (1 + SL_PCT), 2)
-
     state["in_trade"] = True
     state["trade_side"] = side
     state["entry_price"] = entry_price
     state["tp_price"] = tp
     state["sl_price"] = sl
-
     potential_win = round(balance * TP_PCT - fee, 2)
     potential_loss = round(-(balance * SL_PCT) - fee, 2)
-
     trade = {
         "time": candle_time,
         "side": side,
@@ -204,7 +199,6 @@ def open_trade(side, entry_price, candle_time):
     state["trades"].append(trade)
     save_trade(trade)
     save_state()
-
     print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} | SL: {sl} | Win: {fmt(potential_win)} | Loss: {fmt(potential_loss)}")
 
 
@@ -213,29 +207,21 @@ def close_trade(status, exit_price):
         balance = state["balance"]
         fee = round(balance * FEE_PCT, 2)
         side = state["trade_side"]
-
         if side == "LONG":
             pnl = round(balance * TP_PCT - fee, 2) if status == "WIN" else round(-(balance * SL_PCT) - fee, 2)
         else:
             pnl = round(balance * TP_PCT - fee, 2) if status == "WIN" else round(-(balance * SL_PCT) - fee, 2)
-
         new_balance = round(balance + pnl, 2)
         state["balance"] = new_balance
-
         if status == "WIN":
             state["wins"] += 1
         else:
             state["losses"] += 1
-
         state["in_trade"] = False
         state["trade_side"] = None
         state["entry_price"] = None
         state["tp_price"] = None
         state["sl_price"] = None
-
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
-        # Update last open trade in DB
         try:
             conn = get_db()
             cur = conn.cursor()
@@ -248,7 +234,6 @@ def close_trade(status, exit_price):
             conn.close()
         except Exception as e:
             print(f"DB close trade error: {str(e)}")
-
         save_state()
         print(f"TRADE CLOSED: {status} | Exit: {exit_price} | PnL: {fmt(pnl)} | New Balance: {fmt(new_balance)}")
 
@@ -264,8 +249,10 @@ def get_btc_price():
         print(f"Price fetch error: {str(e)}")
         return None
 
+
 def check_price():
     try:
+        # Read directly from DB every time - no memory dependency
         conn = get_db()
         cur = conn.cursor()
         cur.execute("SELECT key, value FROM bot_state")
@@ -280,6 +267,15 @@ def check_price():
         tp = float(data["tp_price"])
         sl = float(data["sl_price"])
         side = data["trade_side"]
+        balance = float(data["balance"])
+
+        # Update memory to stay in sync
+        with state_lock:
+            state["in_trade"] = True
+            state["trade_side"] = side
+            state["tp_price"] = tp
+            state["sl_price"] = sl
+            state["balance"] = balance
 
         price = get_btc_price()
         if price is None:
@@ -294,7 +290,6 @@ def check_price():
             elif price <= sl:
                 print(f"SL HIT (LONG) at {price}")
                 close_trade("LOSS", price)
-
         elif side == "SHORT":
             if price <= tp:
                 print(f"TP HIT (SHORT) at {price}")
@@ -305,40 +300,47 @@ def check_price():
 
     except Exception as e:
         print(f"check_price error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+def price_watcher_loop():
+    print("Price watcher loop started")
+    while True:
+        try:
+            check_price()
+        except Exception as e:
+            print(f"Watcher loop error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        time.sleep(30)
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         raw = request.get_data(as_text=True)
         print("Raw webhook: " + raw)
-
         data = request.get_json(force=True, silent=True)
         if not data:
             print("ERROR: Could not parse JSON")
             return jsonify({"error": "invalid json"}), 400
-
         dot = str(data.get("dot", "")).lower().strip()
         value = safe_float(data.get("value", 0))
         close_price = safe_float(data.get("close", None))
-
         if value is None:
             print("ERROR: invalid value")
             return jsonify({"error": "invalid value"}), 400
-
         if close_price is None:
             print("ERROR: missing close price")
             return jsonify({"error": "invalid close"}), 400
-
         print(f"Dot: {dot} | Value: {round(value, 2)} | Close: {close_price}")
-
         with state_lock:
             state["candle_count"] += 1
             candle = state["candle_count"]
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
             if dot == "green":
                 anchor = state["green_anchor"]
-
                 if anchor is None:
                     if value <= -ANCHOR_LEVEL:
                         state["green_anchor"] = {"value": value, "candle": candle}
@@ -362,10 +364,8 @@ def webhook():
                             print(f"NEW GREEN anchor: {round(value, 2)}")
                         else:
                             print(f"Green dot {round(value, 2)} ignored - anchor kept at {round(anchor['value'], 2)}")
-
             elif dot == "red":
                 anchor = state["red_anchor"]
-
                 if anchor is None:
                     if value >= ANCHOR_LEVEL:
                         state["red_anchor"] = {"value": value, "candle": candle}
@@ -389,12 +389,9 @@ def webhook():
                             print(f"NEW RED anchor: {round(value, 2)}")
                         else:
                             print(f"Red dot {round(value, 2)} ignored - anchor kept at {round(anchor['value'], 2)}")
-
             else:
                 print("Unknown dot type: " + dot)
-
         return jsonify({"status": "ok"}), 200
-
     except Exception as e:
         print("CRITICAL ERROR: " + str(e))
         import traceback
@@ -405,7 +402,6 @@ def webhook():
 @app.route("/", methods=["GET"])
 def dashboard():
     try:
-        load_state()
         all_trades = load_trades()
         recent = list(reversed(all_trades[-10:]))
         rows = ""
@@ -431,16 +427,13 @@ def dashboard():
             )
         if not rows:
             rows = "<tr><td colspan='8' style='color:#555'>Waiting for signals...</td></tr>"
-
         green = str(round(state["green_anchor"]["value"], 1)) if state["green_anchor"] else "None"
         red = str(round(state["red_anchor"]["value"], 1)) if state["red_anchor"] else "None"
         trade = "YES - " + str(state["trade_side"]) if state["in_trade"] else "No"
         tp_display = fmt(state["tp_price"]) if state["tp_price"] else "-"
         sl_display = fmt(state["sl_price"]) if state["sl_price"] else "-"
-
         total_trades = state["wins"] + state["losses"]
         win_rate = str(round(state["wins"] / total_trades * 100)) + "%" if total_trades > 0 else "-"
-
         html = (
             "<!DOCTYPE html><html><head><title>TB-1000</title>"
             "<meta http-equiv='refresh' content='10'>"
@@ -508,15 +501,6 @@ def reset():
 init_db()
 load_state()
 
-def price_watcher_loop():
-    while True:
-        try:
-            check_price()
-        except Exception as e:
-            print(f"Watcher loop error: {str(e)}")
-        time.sleep(30)
-
-import time
 watcher_thread = threading.Thread(target=price_watcher_loop, daemon=True)
 watcher_thread.start()
 print("Price watcher started (thread, every 30s)")
