@@ -501,6 +501,6 @@ def reset():
 init_db()
 load_state()
 
-watcher_thread = threading.Thread(target=price_watcher_loop, daemon=True)
+watcher_thread = threading.Thread(target=price_watcher_loop, daemon=False)
 watcher_thread.start()
 print("Price watcher started (thread, every 30s)")
