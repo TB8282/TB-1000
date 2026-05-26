@@ -2,11 +2,16 @@ import psycopg2
 import requests
 import time
 import os
+import sys
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 FEE_PCT = 0.0002
 TP_PCT = 0.0045
 SL_PCT = 0.0035
+
+def log(msg):
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -20,6 +25,7 @@ def check_and_close():
     conn.close()
 
     if data.get("in_trade") != "True":
+        log("No trade open")
         return
 
     tp = float(data["tp_price"])
@@ -30,7 +36,7 @@ def check_and_close():
     r = requests.get("https://api.crypto.com/v2/public/get-ticker?instrument_name=BTC_USDT", timeout=10)
     price = float(r.json()["result"]["data"][0]["a"])
 
-    print(f"Price: {price} | TP: {tp} | SL: {sl} | Side: {side}")
+    log(f"Price: {price} | TP: {tp} | SL: {sl} | Side: {side}")
 
     hit = None
     if side == "LONG":
@@ -65,11 +71,15 @@ def check_and_close():
         conn.commit()
         cur.close()
         conn.close()
-        print(f"TRADE CLOSED: {hit} | Exit: {price} | PnL: {pnl} | New Balance: {new_balance}")
+        log(f"TRADE CLOSED: {hit} | Exit: {price} | PnL: {pnl} | New Balance: {new_balance}")
 
+log("Worker starting...")
 while True:
     try:
         check_and_close()
     except Exception as e:
-        print(f"Error: {e}")
+        log(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
     time.sleep(30)
