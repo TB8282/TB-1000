@@ -7,7 +7,7 @@ import sys
 DATABASE_URL = os.environ.get("DATABASE_URL")
 FEE_PCT = 0.0002
 TP_PCT = 0.0045
-SL_PCT = 0.0035
+SL_PCT = 0.0045
 
 def log(msg):
     print(msg, flush=True)
