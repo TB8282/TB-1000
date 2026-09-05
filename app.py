@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os
 import threading
+import time
 import psycopg2
 from datetime import datetime
 from kraken_client import KrakenClient
@@ -120,14 +121,49 @@ def save_trade(t):
         print(f"DB save trade error: {e}")
 
 
-def open_trade(side, entry_price, candle_time):
+def open_trade(side, webhook_close_price, candle_time):
     """
-    Places the real entry order on Kraken, then places TWO SEPARATE
-    close orders (TP and SL) since the API doesn't support both together.
-    Kraken confirmed: close2 parameter is silently ignored.
+    Places the real entry order on Kraken, then queries Kraken for the
+    ACTUAL fill price (not the webhook's close price, which may be HA-
+    distorted if the chart uses Heikin Ashi candles). TP/SL are
+    calculated from the real fill price, so HA vs regular candle
+    differences don't affect trade accuracy - only the DOT SIGNAL
+    itself comes from the chart; the price math comes from Kraken.
     """
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
+
+    # STEP 1: Place entry order (market order, fills near-instantly)
+    entry_result = kraken.place_entry_order(PAIR, entry_side, VOLUME, LEVERAGE)
+    if entry_result.get("error"):
+        print(f"ENTRY ORDER FAILED: {entry_result['error']}")
+        return
+    print(f"Entry order placed: {entry_result}")
+
+    entry_txid = entry_result.get("result", {}).get("txid", [None])[0]
+    if not entry_txid:
+        print("ENTRY FAILED: no txid returned, cannot proceed")
+        return
+
+    # STEP 2: Poll briefly for the real fill price (market orders fill fast,
+    # but not always instantly - retry a few times before giving up)
+    entry_price = None
+    for attempt in range(5):
+        time.sleep(1)
+        order_info = kraken.query_orders([entry_txid])
+        order_data = order_info.get("result", {}).get(entry_txid, {})
+        if order_data.get("status") == "closed":
+            entry_price = float(order_data.get("price", 0))
+            break
+
+    if not entry_price:
+        print("WARNING: Could not confirm real fill price after 5 attempts. "
+              f"Falling back to webhook close price ({webhook_close_price}) - "
+              "this may be HA-distorted if chart uses Heikin Ashi.")
+        entry_price = webhook_close_price
+    else:
+        print(f"Confirmed REAL fill price from Kraken: {entry_price} "
+              f"(webhook sent: {webhook_close_price})")
 
     if side == "LONG":
         tp = round(entry_price * (1 + TP_PCT), 1)
@@ -136,14 +172,7 @@ def open_trade(side, entry_price, candle_time):
         tp = round(entry_price * (1 - TP_PCT), 1)
         sl = round(entry_price * (1 + SL_PCT), 1)
 
-    # STEP 1: Place entry order
-    entry_result = kraken.place_entry_order(PAIR, entry_side, VOLUME, LEVERAGE)
-    if entry_result.get("error"):
-        print(f"ENTRY ORDER FAILED: {entry_result['error']}")
-        return
-    print(f"Entry order placed: {entry_result}")
-
-    # STEP 2: Place TP order (standalone conditional)
+    # STEP 3: Place TP order (standalone conditional)
     tp_result = kraken.place_close_order(PAIR, exit_side, VOLUME, "take-profit", tp, LEVERAGE)
     tp_txid = None
     if tp_result.get("error"):
