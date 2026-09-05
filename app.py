@@ -15,6 +15,8 @@ TRIGGER_MIN_RED = -15      # was -5 - red trigger must be >= -15
 TP_PCT = 0.0050            # 0.50%
 SL_PCT = 0.0050            # 0.50%
 LEVERAGE = 10              # confirmed max via Kraken API tonight
+BALANCE_SAFETY_PCT = 0.95  # use 95% of balance*leverage to avoid Kraken's
+                           # buying-power rejection ("Cannot be greater than X USD")
 PAIR = "XBTUSD"
 # NOTE: VOLUME is no longer fixed - it's now calculated fresh before every
 # trade based on your ACTUAL current Kraken balance. See calculate_volume().
@@ -125,13 +127,19 @@ def save_trade(t):
 
 def calculate_volume():
     """
-    Calculates position size using your FULL current Kraken balance,
-    at the confirmed 10x leverage. This is what makes the bot actually
-    use "full balance per trade, compounding" like every backtest
-    tonight assumed - it queries your REAL balance right before each
-    trade, not a fixed number.
+    Calculates position size using 95% of your FULL current Kraken
+    balance, at the confirmed 10x leverage. This is what makes the bot
+    actually use "full balance per trade, compounding" like every
+    backtest tonight assumed - it queries your REAL balance right
+    before each trade, not a fixed number.
 
-    volume (in BTC) = (balance_usd * leverage) / current_btc_price
+    The 5% haircut (BALANCE_SAFETY_PCT) exists because Kraken rejects
+    orders that exceed your true buying power (confirmed live: a $100
+    balance at 10x showed a hard cap of $980 available to trade, not
+    a full $1,000) - this buffer keeps every order safely under that
+    ceiling instead of risking an ENTRY ORDER FAILED abort.
+
+    volume (in BTC) = (balance_usd * BALANCE_SAFETY_PCT * leverage) / current_btc_price
     """
     bal_result = kraken.get_balance()
     if bal_result.get("error"):
@@ -151,10 +159,10 @@ def calculate_volume():
         print(f"Could not fetch current price for volume calc: {e}")
         return None
 
-    notional = usd_balance * LEVERAGE
+    notional = usd_balance * BALANCE_SAFETY_PCT * LEVERAGE
     volume = round(notional / current_price, 8)
-    print(f"Volume calc: balance=${usd_balance:.2f} | price=${current_price:.1f} | "
-          f"notional=${notional:.2f} | volume={volume} BTC")
+    print(f"Volume calc: balance=${usd_balance:.2f} | safety={BALANCE_SAFETY_PCT} | "
+          f"price=${current_price:.1f} | notional=${notional:.2f} | volume={volume} BTC")
     return volume
 
 
