@@ -36,6 +36,44 @@ def get_db():
     return psycopg2.connect(DATABASE_URL)
 
 
+def init_db():
+    """
+    Creates the tables if they don't exist. Runs on every worker startup.
+    This is needed here because only worker.py is actually running as a
+    deployed service right now - app.py's init_db() never executes.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS kraken_bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS kraken_trades (
+                id SERIAL PRIMARY KEY,
+                time TEXT,
+                side TEXT,
+                entry_price REAL,
+                tp_price REAL,
+                sl_price REAL,
+                tp_txid TEXT,
+                sl_txid TEXT,
+                status TEXT,
+                exit_price REAL,
+                closed_time TEXT
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("Kraken DB tables initialized (from worker.py)")
+    except Exception as e:
+        print(f"DB init error: {e}")
+
+
 def load_bot_state():
     conn = get_db()
     cur = conn.cursor()
@@ -173,4 +211,5 @@ def worker_loop():
 
 
 if __name__ == "__main__":
+    init_db()
     worker_loop()
