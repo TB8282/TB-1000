@@ -16,7 +16,8 @@ TP_PCT = 0.0050            # 0.50%
 SL_PCT = 0.0050            # 0.50%
 LEVERAGE = 10              # confirmed max via Kraken API tonight
 PAIR = "XBTUSD"
-VOLUME = os.environ.get("TRADE_VOLUME", "0.00010")  # contract size - TUNE THIS
+# NOTE: VOLUME is no longer fixed - it's now calculated fresh before every
+# trade based on your ACTUAL current Kraken balance. See calculate_volume().
 
 KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
 KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET")
@@ -33,6 +34,7 @@ state = {
     "tp_txid": None,
     "sl_txid": None,
     "entry_time": None,
+    "volume": None,
     "green_anchor": None,
     "red_anchor": None,
     "candle_count": 0,
@@ -91,7 +93,7 @@ def save_state():
         conn = get_db()
         cur = conn.cursor()
         for key in ["in_trade", "trade_side", "entry_price", "tp_price",
-                    "sl_price", "tp_txid", "sl_txid", "entry_time",
+                    "sl_price", "tp_txid", "sl_txid", "entry_time", "volume",
                     "wins", "losses"]:
             cur.execute("""
                 INSERT INTO kraken_bot_state (key, value) VALUES (%s, %s)
@@ -121,6 +123,41 @@ def save_trade(t):
         print(f"DB save trade error: {e}")
 
 
+def calculate_volume():
+    """
+    Calculates position size using your FULL current Kraken balance,
+    at the confirmed 10x leverage. This is what makes the bot actually
+    use "full balance per trade, compounding" like every backtest
+    tonight assumed - it queries your REAL balance right before each
+    trade, not a fixed number.
+
+    volume (in BTC) = (balance_usd * leverage) / current_btc_price
+    """
+    bal_result = kraken.get_balance()
+    if bal_result.get("error"):
+        print(f"BALANCE CHECK FAILED: {bal_result['error']}")
+        return None
+    balance_data = bal_result.get("result", {})
+    # ZUSD is Kraken's code for USD balance
+    usd_balance = float(balance_data.get("ZUSD", 0))
+    if usd_balance <= 0:
+        print(f"WARNING: USD balance is {usd_balance} - nothing to trade with.")
+        return None
+
+    ticker = kraken.get_ticker(PAIR)
+    try:
+        current_price = float(list(ticker["result"].values())[0]["c"][0])
+    except Exception as e:
+        print(f"Could not fetch current price for volume calc: {e}")
+        return None
+
+    notional = usd_balance * LEVERAGE
+    volume = round(notional / current_price, 8)
+    print(f"Volume calc: balance=${usd_balance:.2f} | price=${current_price:.1f} | "
+          f"notional=${notional:.2f} | volume={volume} BTC")
+    return volume
+
+
 def open_trade(side, webhook_close_price, candle_time):
     """
     Places the real entry order on Kraken, then queries Kraken for the
@@ -132,6 +169,11 @@ def open_trade(side, webhook_close_price, candle_time):
     """
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
+
+    VOLUME = calculate_volume()
+    if not VOLUME:
+        print("TRADE ABORTED: could not calculate volume from live balance.")
+        return
 
     # STEP 1: Place entry order (market order, fills near-instantly)
     entry_result = kraken.place_entry_order(PAIR, entry_side, VOLUME, LEVERAGE)
@@ -197,6 +239,7 @@ def open_trade(side, webhook_close_price, candle_time):
         state["tp_txid"] = tp_txid
         state["sl_txid"] = sl_txid
         state["entry_time"] = candle_time
+        state["volume"] = VOLUME
 
     save_trade({
         "time": candle_time, "side": side, "entry_price": entry_price,
