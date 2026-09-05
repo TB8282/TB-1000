@@ -22,7 +22,8 @@ from kraken_client import KrakenClient
 
 PAIR = "XBTUSD"
 LEVERAGE = 10
-VOLUME = os.environ.get("TRADE_VOLUME", "0.00010")
+# NOTE: No fixed VOLUME here anymore - each trade's actual volume is
+# saved to the database when app.py opens it, and read back below.
 PROFIT_TIMEOUT_HOURS = float(os.environ.get("PROFIT_TIMEOUT_HOURS", 12))  # TUNE THIS - not yet finalized
 
 KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
@@ -184,11 +185,15 @@ def check_current_trade():
             if in_profit:
                 print(f"PROFIT-TIMEOUT triggered after {hours_open:.1f}hrs - closing at market")
                 close_side = "sell" if side == "LONG" else "buy"
+                trade_volume = data.get("volume")
+                if not trade_volume or trade_volume == "None":
+                    print("WARNING: no saved volume for this trade, cannot timeout-close safely.")
+                    return
                 # Cancel both pending orders first
                 kraken.cancel_order(tp_txid)
                 kraken.cancel_order(sl_txid)
-                # Market close
-                close_result = kraken.place_entry_order(PAIR, close_side, VOLUME, LEVERAGE)
+                # Market close using the SAME volume as the original entry
+                close_result = kraken.place_entry_order(PAIR, close_side, trade_volume, LEVERAGE)
                 print(f"Timeout close result: {close_result}")
                 close_trade_record("WIN", current_price)
                 wins = int(data.get("wins", 0)) + 1
@@ -200,14 +205,14 @@ def check_current_trade():
 
 
 def worker_loop():
-    print("Kraken worker started - polling every 30s")
+    print("Kraken worker started - polling every 5s")
     while True:
         try:
             check_current_trade()
         except Exception as e:
             import traceback
             traceback.print_exc()
-        time.sleep(30)
+        time.sleep(5)
 
 
 if __name__ == "__main__":
