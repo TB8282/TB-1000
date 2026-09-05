@@ -312,15 +312,96 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 
+def fmt(n):
+    try:
+        return "${:,.2f}".format(float(n))
+    except (TypeError, ValueError):
+        return "$0.00"
+
+
+def load_trades():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT time, side, entry_price, tp_price, sl_price, status, exit_price
+            FROM kraken_trades ORDER BY id DESC LIMIT 10
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"Load trades error: {e}")
+        return []
+
+
 @app.route("/", methods=["GET"])
 def dashboard():
     bal_result = kraken.get_balance()
-    balance = bal_result.get("result", {})
-    return jsonify({
-        "state": state,
-        "kraken_balance": balance,
-        "note": "Full HTML dashboard not yet rebuilt for Kraken - this is raw JSON for now"
-    })
+    balance_data = bal_result.get("result", {})
+    usd_balance = float(balance_data.get("ZUSD", 0))
+
+    rows_html = ""
+    for t in load_trades():
+        time_, side, entry, tp, sl, status, exit_price = t
+        color = "#00ff88" if status == "WIN" else "red" if status == "LOSS" else "#aaa"
+        exit_display = fmt(exit_price) if exit_price else "-"
+        rows_html += (
+            "<tr>"
+            f"<td>{time_}</td><td>{side}</td>"
+            f"<td>{fmt(entry)}</td>"
+            f"<td style='color:#00ff88'>{fmt(tp)}</td>"
+            f"<td style='color:red'>{fmt(sl)}</td>"
+            f"<td style='color:{color}'>{status}</td>"
+            f"<td>{exit_display}</td>"
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html = "<tr><td colspan='7' style='color:#555'>Waiting for signals...</td></tr>"
+
+    green = str(round(state["green_anchor"]["value"], 1)) if state["green_anchor"] else "None"
+    red = str(round(state["red_anchor"]["value"], 1)) if state["red_anchor"] else "None"
+    trade = f"YES - {state['trade_side']}" if state["in_trade"] else "No"
+    tp_display = fmt(state["tp_price"]) if state["tp_price"] else "-"
+    sl_display = fmt(state["sl_price"]) if state["sl_price"] else "-"
+    total = state["wins"] + state["losses"]
+    win_rate = f"{round(state['wins']/total*100)}%" if total > 0 else "-"
+
+    html = (
+        "<!DOCTYPE html><html><head><title>TB-1000 Kraken</title>"
+        "<meta http-equiv='refresh' content='10'>"
+        "<style>"
+        "body{background:#0d0d0d;color:#eee;font-family:sans-serif;padding:2rem;}"
+        "h1{color:#00ff88;}"
+        ".g{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin:1rem 0;}"
+        ".c{background:#1a1a1a;border-radius:8px;padding:1rem;}"
+        ".l{font-size:12px;color:#888;margin-bottom:4px;}"
+        ".v{font-size:20px;font-weight:bold;color:#00ff88;}"
+        "table{width:100%;border-collapse:collapse;margin-top:1rem;}"
+        "th,td{padding:8px;border-bottom:1px solid #333;text-align:left;font-size:13px;}"
+        "th{color:#888;font-size:12px;}"
+        "</style></head><body>"
+        "<h1>TB-1000 Kraken Bot (10x Leverage)</h1>"
+        "<div class='g'>"
+        f"<div class='c'><div class='l'>Kraken Balance (USD)</div><div class='v'>{fmt(usd_balance)}</div></div>"
+        f"<div class='c'><div class='l'>Wins</div><div class='v'>{state['wins']}</div></div>"
+        f"<div class='c'><div class='l'>Losses</div><div class='v'>{state['losses']}</div></div>"
+        f"<div class='c'><div class='l'>Win Rate</div><div class='v'>{win_rate}</div></div>"
+        f"<div class='c'><div class='l'>In Trade</div><div class='v'>{trade}</div></div>"
+        f"<div class='c'><div class='l'>Live TP</div><div class='v'>{tp_display}</div></div>"
+        f"<div class='c'><div class='l'>Live SL</div><div class='v'>{sl_display}</div></div>"
+        f"<div class='c'><div class='l'>Green Anchor</div><div class='v'>{green}</div></div>"
+        f"<div class='c'><div class='l'>Red Anchor</div><div class='v'>{red}</div></div>"
+        f"<div class='c'><div class='l'>Leverage</div><div class='v'>{LEVERAGE}x</div></div>"
+        "</div>"
+        "<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Status</th><th>Exit</th></tr>"
+        + rows_html +
+        "</table>"
+        "<p style='color:#555;font-size:11px;margin-top:1rem'>Auto-refreshes every 10 seconds | Live on Kraken</p>"
+        "</body></html>"
+    )
+    return html
 
 
 @app.route("/ping", methods=["GET"])
