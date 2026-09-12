@@ -1,8 +1,3 @@
-**Link:** https://github.com/TB8282/TB-1000/edit/main/app.py
-
-**Where:** Select everything in that editor box (Ctrl+A), delete it, then paste the code below in its place. Then click "Commit changes."
-
-**Code:**```python
 from flask import Flask, request, jsonify
 import os
 import threading
@@ -406,4 +401,3 @@ init_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-```
