@@ -7,11 +7,20 @@ This worker polls Coinbase's own order status via the API, since TP/SL
 orders are placed directly on the exchange (two separate orders, same
 constraint as Kraken - see coinbase_client.py).
 
-PROFIT-TIMEOUT RULE (unchanged from Kraken version):
-If a trade has been open longer than PROFIT_TIMEOUT_HOURS AND is
-currently sitting in profit, force-close it at market. If it's
-underwater at that point, let it keep running toward SL or eventual
-recovery - do NOT force a loss just because time ran out.
+SCRATCH RULE (new):
+Once a trade's unrealized profit reaches SCRATCH_ARM_PCT (0.5%), the
+trade is "armed." If price then retraces back to the entry price while
+armed, the trade is force-closed flat (a scratch) - cancels both TP/SL
+orders and closes at market. The real -0.75% SL stays live on the
+exchange the entire time as a hard floor in case of a sudden wick;
+this scratch logic is an independent watcher on top of it, not a
+replacement for it.
+
+TIE RULE (changed from old PROFIT-TIMEOUT rule):
+If a trade has been open longer than PROFIT_TIMEOUT_HOURS, it is
+force-closed at market UNCONDITIONALLY - win, loss, or flat - and
+logged as a TIE. This replaces the old behavior of only closing if
+in profit and letting losers ride toward SL.
 """
 
 import os
@@ -21,7 +30,8 @@ from datetime import datetime
 from coinbase_client import CoinbaseClient, PRODUCT_ID
 
 LEVERAGE = 10
-PROFIT_TIMEOUT_HOURS = float(os.environ.get("PROFIT_TIMEOUT_HOURS", 12))
+PROFIT_TIMEOUT_HOURS = float(os.environ.get("PROFIT_TIMEOUT_HOURS", 24))
+SCRATCH_ARM_PCT = 0.005  # 0.5% - once profit reaches this, arm the scratch watcher
 
 CDP_API_KEY_NAME = os.environ.get("CDP_API_KEY_NAME")
 CDP_API_KEY_PRIVATE_KEY = os.environ.get("CDP_API_KEY_PRIVATE_KEY")
@@ -107,6 +117,37 @@ def close_trade_record(status, exit_price):
     conn.close()
 
 
+def force_close_at_market(data, tp_order_id, sl_order_id, side, trade_contracts, status_label):
+    """
+    Shared close path for both SCRATCH and TIE outcomes: cancels both
+    open TP/SL orders, closes the position at market, records the
+    result, and resets bot state. status_label is "SCRATCH" or "TIE".
+    """
+    close_side = "sell" if side == "LONG" else "buy"
+
+    if tp_order_id and tp_order_id != "None":
+        cancel_tp = coinbase.cancel_order(tp_order_id)
+        print(f"Cancel TP result: {cancel_tp}")
+    if sl_order_id and sl_order_id != "None":
+        cancel_sl = coinbase.cancel_order(sl_order_id)
+        print(f"Cancel SL result: {cancel_sl}")
+
+    if not trade_contracts or trade_contracts == "None":
+        print(f"WARNING: no saved contract count, cannot {status_label}-close safely.")
+        return
+
+    close_result = coinbase.place_entry_order(close_side, int(trade_contracts), LEVERAGE)
+    print(f"{status_label} close result: {close_result}")
+
+    ticker_result = coinbase.get_ticker()
+    exit_price = ticker_result["result"]["price"] if not ticker_result.get("error") else 0
+
+    close_trade_record(status_label, exit_price)
+    update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
+                      sl_order_id=None, scratch_armed=False)
+    print(f"TRADE CLOSED: {status_label}")
+
+
 def check_current_trade():
     data = load_bot_state()
     if data.get("in_trade") != "True":
@@ -116,6 +157,9 @@ def check_current_trade():
     sl_order_id = data.get("sl_order_id")
     side = data.get("trade_side")
     entry_time_str = data.get("entry_time")
+    entry_price = float(data.get("entry_price", 0))
+    trade_contracts = data.get("contracts")
+    scratch_armed = data.get("scratch_armed") == "True"
 
     if not tp_order_id or not sl_order_id or tp_order_id == "None" or sl_order_id == "None":
         print("WARNING: Missing order IDs, cannot monitor this trade properly.")
@@ -140,7 +184,7 @@ def check_current_trade():
         close_trade_record("WIN", exit_price)
         wins = int(data.get("wins", 0)) + 1
         update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
-                          sl_order_id=None, wins=wins)
+                          sl_order_id=None, wins=wins, scratch_armed=False)
         print("TRADE CLOSED: WIN")
         return
 
@@ -152,11 +196,38 @@ def check_current_trade():
         close_trade_record("LOSS", exit_price)
         losses = int(data.get("losses", 0)) + 1
         update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
-                          sl_order_id=None, losses=losses)
+                          sl_order_id=None, losses=losses, scratch_armed=False)
         print("TRADE CLOSED: LOSS")
         return
 
-    # Neither filled yet - check profit-timeout rule
+    # Neither TP nor SL filled yet - check scratch and timeout rules
+    ticker_result = coinbase.get_ticker()
+    if ticker_result.get("error"):
+        print(f"Could not fetch current price: {ticker_result['error']}")
+        return
+    current_price = ticker_result["result"]["price"]
+
+    if entry_price > 0:
+        profit_pct = ((current_price - entry_price) / entry_price if side == "LONG"
+                      else (entry_price - current_price) / entry_price)
+
+        if not scratch_armed and profit_pct >= SCRATCH_ARM_PCT:
+            scratch_armed = True
+            update_bot_state(scratch_armed=True)
+            print(f"SCRATCH ARMED at {round(profit_pct*100, 3)}% profit")
+
+        if scratch_armed:
+            retraced_to_entry = (
+                (side == "LONG" and current_price <= entry_price) or
+                (side == "SHORT" and current_price >= entry_price)
+            )
+            if retraced_to_entry:
+                print(f"SCRATCH TRIGGERED - price retraced to entry ({entry_price})")
+                force_close_at_market(data, tp_order_id, sl_order_id, side,
+                                       trade_contracts, "SCRATCH")
+                return
+
+    # TIE rule - unconditional close after PROFIT_TIMEOUT_HOURS, regardless of P&L
     if entry_time_str and entry_time_str != "None":
         try:
             entry_time = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M")
@@ -165,36 +236,9 @@ def check_current_trade():
             hours_open = 0
 
         if hours_open >= PROFIT_TIMEOUT_HOURS:
-            ticker_result = coinbase.get_ticker()
-            if ticker_result.get("error"):
-                print(f"Could not fetch current price for timeout check: {ticker_result['error']}")
-                return
-            current_price = ticker_result["result"]["price"]
-
-            entry_price = float(data.get("entry_price", 0))
-            in_profit = (
-                (side == "LONG" and current_price > entry_price) or
-                (side == "SHORT" and current_price < entry_price)
-            )
-
-            if in_profit:
-                print(f"PROFIT-TIMEOUT triggered after {hours_open:.1f}hrs - closing at market")
-                close_side = "sell" if side == "LONG" else "buy"
-                trade_contracts = data.get("contracts")
-                if not trade_contracts or trade_contracts == "None":
-                    print("WARNING: no saved contract count for this trade, cannot timeout-close safely.")
-                    return
-                coinbase.cancel_order(tp_order_id)
-                coinbase.cancel_order(sl_order_id)
-                close_result = coinbase.place_entry_order(close_side, int(trade_contracts), LEVERAGE)
-                print(f"Timeout close result: {close_result}")
-                close_trade_record("WIN", current_price)
-                wins = int(data.get("wins", 0)) + 1
-                update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
-                                  sl_order_id=None, wins=wins)
-                print("TRADE CLOSED: WIN (profit-timeout)")
-            else:
-                print(f"Trade open {hours_open:.1f}hrs, underwater - letting it ride toward SL")
+            print(f"TIE TRIGGERED after {hours_open:.1f}hrs - closing unconditionally")
+            force_close_at_market(data, tp_order_id, sl_order_id, side,
+                                   trade_contracts, "TIE")
 
 
 def worker_loop():
