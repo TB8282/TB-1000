@@ -12,8 +12,8 @@ app = Flask(__name__)
 ANCHOR_LEVEL = 35
 TRIGGER_MAX_GREEN = 15
 TRIGGER_MIN_RED = -15
-TP_PCT = 0.0150            # 1.5% - updated from 0.50%, confirmed breakeven math
-SL_PCT = 0.0150            # 1.5% - updated from 0.50%
+TP_PCT = 0.0075            # 0.75%
+SL_PCT = 0.0075            # 0.75%
 LEVERAGE = 10              # requested leverage for preview/order calls; ACTUAL
                            # leverage Coinbase grants varies by intraday/overnight
                            # margin window - real margin is now pulled live via
@@ -147,9 +147,14 @@ def calculate_contracts(entry_side):
         print(f"BALANCE CHECK FAILED: {bal_result['error']}")
         return None
     balance_data = bal_result.get("result", {}).get("balance_summary", {})
-    usd_balance = float(balance_data.get("cfm_usd_balance", {}).get("value", 0))
+    # NOTE: cfm_usd_balance is correctly $0 when flat - Coinbase only sweeps
+    # cash from the CBI spot account into CFM at the moment an order actually
+    # needs margin (confirmed via Coinbase docs, Sep 12 2026). Checking
+    # cbi_usd_balance instead reflects the real spendable balance that will
+    # auto-transfer when this order is placed.
+    usd_balance = float(balance_data.get("cbi_usd_balance", {}).get("value", 0))
     if usd_balance <= 0:
-        print(f"WARNING: CFM USD balance is {usd_balance} - nothing to trade with.")
+        print(f"WARNING: CBI USD balance is {usd_balance} - nothing to trade with.")
         return None
 
     preview_result = coinbase.place_entry_order(entry_side, 1, LEVERAGE, validate=True)
