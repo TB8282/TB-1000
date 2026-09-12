@@ -90,6 +90,56 @@ def init_db():
         print(f"DB init error: {e}")
 
 
+def load_state():
+    """
+    Loads persisted bot state from the DB on startup. Without this,
+    app.py's in-memory state dict resets to defaults (in_trade=False)
+    on every redeploy/restart, even if a real trade is still open on
+    Coinbase and being tracked by worker.py via the same DB table.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM coinbase_bot_state")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        db_values = {k: v for k, v in rows}
+        if not db_values:
+            print("No saved state found in DB - starting fresh.")
+            return
+
+        with state_lock:
+            if "in_trade" in db_values:
+                state["in_trade"] = db_values["in_trade"] == "True"
+            if "trade_side" in db_values:
+                state["trade_side"] = None if db_values["trade_side"] == "None" else db_values["trade_side"]
+            if "entry_price" in db_values:
+                state["entry_price"] = safe_float(db_values["entry_price"])
+            if "tp_price" in db_values:
+                state["tp_price"] = safe_float(db_values["tp_price"])
+            if "sl_price" in db_values:
+                state["sl_price"] = safe_float(db_values["sl_price"])
+            if "tp_order_id" in db_values:
+                state["tp_order_id"] = None if db_values["tp_order_id"] == "None" else db_values["tp_order_id"]
+            if "sl_order_id" in db_values:
+                state["sl_order_id"] = None if db_values["sl_order_id"] == "None" else db_values["sl_order_id"]
+            if "entry_time" in db_values:
+                state["entry_time"] = None if db_values["entry_time"] == "None" else db_values["entry_time"]
+            if "contracts" in db_values:
+                state["contracts"] = None if db_values["contracts"] == "None" else db_values["contracts"]
+            if "wins" in db_values:
+                state["wins"] = int(db_values["wins"])
+            if "losses" in db_values:
+                state["losses"] = int(db_values["losses"])
+
+        print(f"State loaded from DB: in_trade={state['in_trade']} | "
+              f"trade_side={state['trade_side']} | wins={state['wins']} | losses={state['losses']}")
+    except Exception as e:
+        print(f"State load error: {e}")
+
+
 def save_state():
     try:
         conn = get_db()
@@ -418,6 +468,7 @@ def ping():
 
 
 init_db()
+load_state()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
