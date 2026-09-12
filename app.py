@@ -14,7 +14,10 @@ TRIGGER_MAX_GREEN = 15
 TRIGGER_MIN_RED = -15
 TP_PCT = 0.0150            # 1.5% - updated from 0.50%, confirmed breakeven math
 SL_PCT = 0.0150            # 1.5% - updated from 0.50%
-LEVERAGE = 10
+LEVERAGE = 10              # requested leverage for preview/order calls; ACTUAL
+                           # leverage Coinbase grants varies by intraday/overnight
+                           # margin window - real margin is now pulled live via
+                           # preview_order, not assumed from this constant.
 BALANCE_SAFETY_PCT = 0.95  # same safety buffer concept as Kraken version
 CONTRACT_SIZE_BTC = 0.01   # nano BTC perp = 0.01 BTC per contract
 
@@ -122,14 +125,22 @@ def save_trade(t):
         print(f"DB save trade error: {e}")
 
 
-def calculate_contracts():
+def calculate_contracts(entry_side):
     """
-    Calculates position size in WHOLE CONTRACTS using 95% of current
-    CFM futures balance at 10x leverage. Coinbase nano BTC perp contracts
-    are 0.01 BTC each - this is fundamentally different math from Kraken,
-    which used fractional BTC volume directly.
+    Calculates position size in WHOLE CONTRACTS using the REAL live margin
+    requirement from Coinbase's own preview_order endpoint - NOT a hardcoded
+    leverage assumption.
 
-    contracts = floor((balance_usd * BALANCE_SAFETY_PCT * leverage) / (price * CONTRACT_SIZE_BTC))
+    CONFIRMED LIVE (Sep 12, 2026): actual leverage on a real filled order
+    was 4.1x outside the 8am-4pm ET intraday window, not the assumed 10x.
+    Coinbase's margin requirement changes between intraday and overnight
+    windows, so a fixed LEVERAGE constant cannot be trusted for sizing.
+
+    This previews a 1-contract order (at requested leverage=LEVERAGE) to
+    read back order_margin_total - the REAL dollar margin Coinbase would
+    actually require right now - then sizes the real order off of that.
+
+    contracts = floor((balance_usd * BALANCE_SAFETY_PCT) / margin_per_contract)
     """
     bal_result = coinbase.get_balance()
     if bal_result.get("error"):
@@ -141,18 +152,22 @@ def calculate_contracts():
         print(f"WARNING: CFM USD balance is {usd_balance} - nothing to trade with.")
         return None
 
-    ticker_result = coinbase.get_ticker()
-    if ticker_result.get("error"):
-        print(f"Could not fetch current price for contract calc: {ticker_result['error']}")
+    preview_result = coinbase.place_entry_order(entry_side, 1, LEVERAGE, validate=True)
+    if preview_result.get("error"):
+        print(f"MARGIN PREVIEW FAILED: {preview_result['error']}")
         return None
-    current_price = ticker_result["result"]["price"]
 
-    notional_target = usd_balance * BALANCE_SAFETY_PCT * LEVERAGE
-    contract_notional = current_price * CONTRACT_SIZE_BTC
-    contracts = int(notional_target // contract_notional)
+    preview_data = preview_result.get("result", {})
+    margin_per_contract = safe_float(preview_data.get("order_margin_total"))
+    if not margin_per_contract or margin_per_contract <= 0:
+        print(f"PREVIEW RETURNED NO USABLE MARGIN VALUE: {preview_data}")
+        return None
+
+    available_for_trading = usd_balance * BALANCE_SAFETY_PCT
+    contracts = int(available_for_trading // margin_per_contract)
     print(f"Contract calc: balance=${usd_balance:.2f} | safety={BALANCE_SAFETY_PCT} | "
-          f"price=${current_price:.1f} | notional_target=${notional_target:.2f} | "
-          f"contracts={contracts}")
+          f"margin_per_contract=${margin_per_contract:.2f} (LIVE preview) | "
+          f"available_for_trading=${available_for_trading:.2f} | contracts={contracts}")
     return contracts if contracts > 0 else None
 
 
@@ -165,9 +180,9 @@ def open_trade(side, webhook_close_price, candle_time):
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
 
-    contracts = calculate_contracts()
+    contracts = calculate_contracts(entry_side)
     if not contracts:
-        print("TRADE ABORTED: could not calculate contract size from live balance.")
+        print("TRADE ABORTED: could not calculate contract size from live balance/margin.")
         return
 
     entry_result = coinbase.place_entry_order(entry_side, contracts, LEVERAGE)
