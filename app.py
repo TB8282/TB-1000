@@ -1,31 +1,33 @@
+**Link:** https://github.com/TB8282/TB-1000/edit/main/app.py
+
+**Where:** Select everything in that editor box (Ctrl+A), delete it, then paste the code below in its place. Then click "Commit changes."
+
+**Code:**```python
 from flask import Flask, request, jsonify
 import os
 import threading
 import time
 import psycopg2
 from datetime import datetime
-from kraken_client import KrakenClient
+from coinbase_client import CoinbaseClient, PRODUCT_ID
 
 app = Flask(__name__)
 
-# ============ CONFIRMED RULES (tonight's session) ============
-ANCHOR_LEVEL = 35          # was 30 - green anchor <= -35, red anchor >= +35
-TRIGGER_MAX_GREEN = 15     # was 5 - green trigger must be <= +15
-TRIGGER_MIN_RED = -15      # was -5 - red trigger must be >= -15
-TP_PCT = 0.0050            # 0.50%
-SL_PCT = 0.0050            # 0.50%
-LEVERAGE = 10              # confirmed max via Kraken API tonight
-BALANCE_SAFETY_PCT = 0.95  # use 95% of balance*leverage to avoid Kraken's
-                           # buying-power rejection ("Cannot be greater than X USD")
-PAIR = "XBTUSD"
-# NOTE: VOLUME is no longer fixed - it's now calculated fresh before every
-# trade based on your ACTUAL current Kraken balance. See calculate_volume().
+# ============ CONFIRMED RULES ============
+ANCHOR_LEVEL = 35
+TRIGGER_MAX_GREEN = 15
+TRIGGER_MIN_RED = -15
+TP_PCT = 0.0150            # 1.5% - updated from 0.50%, confirmed breakeven math
+SL_PCT = 0.0150            # 1.5% - updated from 0.50%
+LEVERAGE = 10
+BALANCE_SAFETY_PCT = 0.95  # same safety buffer concept as Kraken version
+CONTRACT_SIZE_BTC = 0.01   # nano BTC perp = 0.01 BTC per contract
 
-KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
-KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET")
+CDP_API_KEY_NAME = os.environ.get("CDP_API_KEY_NAME")
+CDP_API_KEY_PRIVATE_KEY = os.environ.get("CDP_API_KEY_PRIVATE_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-kraken = KrakenClient(KRAKEN_API_KEY, KRAKEN_API_SECRET)
+coinbase = CoinbaseClient(CDP_API_KEY_NAME, CDP_API_KEY_PRIVATE_KEY)
 
 state = {
     "in_trade": False,
@@ -33,10 +35,10 @@ state = {
     "entry_price": None,
     "tp_price": None,
     "sl_price": None,
-    "tp_txid": None,
-    "sl_txid": None,
+    "tp_order_id": None,
+    "sl_order_id": None,
     "entry_time": None,
-    "volume": None,
+    "contracts": None,
     "green_anchor": None,
     "red_anchor": None,
     "candle_count": 0,
@@ -62,21 +64,21 @@ def init_db():
         conn = get_db()
         cur = conn.cursor()
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS kraken_bot_state (
+            CREATE TABLE IF NOT EXISTS coinbase_bot_state (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS kraken_trades (
+            CREATE TABLE IF NOT EXISTS coinbase_trades (
                 id SERIAL PRIMARY KEY,
                 time TEXT,
                 side TEXT,
                 entry_price REAL,
                 tp_price REAL,
                 sl_price REAL,
-                tp_txid TEXT,
-                sl_txid TEXT,
+                tp_order_id TEXT,
+                sl_order_id TEXT,
                 status TEXT,
                 exit_price REAL,
                 closed_time TEXT
@@ -85,7 +87,7 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        print("Kraken DB tables initialized")
+        print("Coinbase DB tables initialized")
     except Exception as e:
         print(f"DB init error: {e}")
 
@@ -95,10 +97,10 @@ def save_state():
         conn = get_db()
         cur = conn.cursor()
         for key in ["in_trade", "trade_side", "entry_price", "tp_price",
-                    "sl_price", "tp_txid", "sl_txid", "entry_time", "volume",
-                    "wins", "losses"]:
+                    "sl_price", "tp_order_id", "sl_order_id", "entry_time",
+                    "contracts", "wins", "losses"]:
             cur.execute("""
-                INSERT INTO kraken_bot_state (key, value) VALUES (%s, %s)
+                INSERT INTO coinbase_bot_state (key, value) VALUES (%s, %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """, (key, str(state.get(key))))
         conn.commit()
@@ -113,11 +115,11 @@ def save_trade(t):
         conn = get_db()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO kraken_trades
-            (time, side, entry_price, tp_price, sl_price, tp_txid, sl_txid, status)
+            INSERT INTO coinbase_trades
+            (time, side, entry_price, tp_price, sl_price, tp_order_id, sl_order_id, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (t["time"], t["side"], t["entry_price"], t["tp_price"], t["sl_price"],
-              t["tp_txid"], t["sl_txid"], "OPEN"))
+              t["tp_order_id"], t["sl_order_id"], "OPEN"))
         conn.commit()
         cur.close()
         conn.close()
@@ -125,94 +127,80 @@ def save_trade(t):
         print(f"DB save trade error: {e}")
 
 
-def calculate_volume():
+def calculate_contracts():
     """
-    Calculates position size using 95% of your FULL current Kraken
-    balance, at the confirmed 10x leverage. This is what makes the bot
-    actually use "full balance per trade, compounding" like every
-    backtest tonight assumed - it queries your REAL balance right
-    before each trade, not a fixed number.
+    Calculates position size in WHOLE CONTRACTS using 95% of current
+    CFM futures balance at 10x leverage. Coinbase nano BTC perp contracts
+    are 0.01 BTC each - this is fundamentally different math from Kraken,
+    which used fractional BTC volume directly.
 
-    The 5% haircut (BALANCE_SAFETY_PCT) exists because Kraken rejects
-    orders that exceed your true buying power (confirmed live: a $100
-    balance at 10x showed a hard cap of $980 available to trade, not
-    a full $1,000) - this buffer keeps every order safely under that
-    ceiling instead of risking an ENTRY ORDER FAILED abort.
-
-    volume (in BTC) = (balance_usd * BALANCE_SAFETY_PCT * leverage) / current_btc_price
+    contracts = floor((balance_usd * BALANCE_SAFETY_PCT * leverage) / (price * CONTRACT_SIZE_BTC))
     """
-    bal_result = kraken.get_balance()
+    bal_result = coinbase.get_balance()
     if bal_result.get("error"):
         print(f"BALANCE CHECK FAILED: {bal_result['error']}")
         return None
-    balance_data = bal_result.get("result", {})
-    # ZUSD is Kraken's code for USD balance
-    usd_balance = float(balance_data.get("ZUSD", 0))
+    balance_data = bal_result.get("result", {}).get("balance_summary", {})
+    usd_balance = float(balance_data.get("cfm_usd_balance", {}).get("value", 0))
     if usd_balance <= 0:
-        print(f"WARNING: USD balance is {usd_balance} - nothing to trade with.")
+        print(f"WARNING: CFM USD balance is {usd_balance} - nothing to trade with.")
         return None
 
-    ticker = kraken.get_ticker(PAIR)
-    try:
-        current_price = float(list(ticker["result"].values())[0]["c"][0])
-    except Exception as e:
-        print(f"Could not fetch current price for volume calc: {e}")
+    ticker_result = coinbase.get_ticker()
+    if ticker_result.get("error"):
+        print(f"Could not fetch current price for contract calc: {ticker_result['error']}")
         return None
+    current_price = ticker_result["result"]["price"]
 
-    notional = usd_balance * BALANCE_SAFETY_PCT * LEVERAGE
-    volume = round(notional / current_price, 8)
-    print(f"Volume calc: balance=${usd_balance:.2f} | safety={BALANCE_SAFETY_PCT} | "
-          f"price=${current_price:.1f} | notional=${notional:.2f} | volume={volume} BTC")
-    return volume
+    notional_target = usd_balance * BALANCE_SAFETY_PCT * LEVERAGE
+    contract_notional = current_price * CONTRACT_SIZE_BTC
+    contracts = int(notional_target // contract_notional)
+    print(f"Contract calc: balance=${usd_balance:.2f} | safety={BALANCE_SAFETY_PCT} | "
+          f"price=${current_price:.1f} | notional_target=${notional_target:.2f} | "
+          f"contracts={contracts}")
+    return contracts if contracts > 0 else None
 
 
 def open_trade(side, webhook_close_price, candle_time):
     """
-    Places the real entry order on Kraken, then queries Kraken for the
-    ACTUAL fill price (not the webhook's close price, which may be HA-
-    distorted if the chart uses Heikin Ashi candles). TP/SL are
-    calculated from the real fill price, so HA vs regular candle
-    differences don't affect trade accuracy - only the DOT SIGNAL
-    itself comes from the chart; the price math comes from Kraken.
+    Places the real entry order on Coinbase, then queries for the ACTUAL
+    fill price. Same HA-distortion protection as the Kraken version -
+    signal comes from the chart, price math comes from the exchange.
     """
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
 
-    VOLUME = calculate_volume()
-    if not VOLUME:
-        print("TRADE ABORTED: could not calculate volume from live balance.")
+    contracts = calculate_contracts()
+    if not contracts:
+        print("TRADE ABORTED: could not calculate contract size from live balance.")
         return
 
-    # STEP 1: Place entry order (market order, fills near-instantly)
-    entry_result = kraken.place_entry_order(PAIR, entry_side, VOLUME, LEVERAGE)
+    entry_result = coinbase.place_entry_order(entry_side, contracts, LEVERAGE)
     if entry_result.get("error"):
         print(f"ENTRY ORDER FAILED: {entry_result['error']}")
         return
     print(f"Entry order placed: {entry_result}")
 
-    entry_txid = entry_result.get("result", {}).get("txid", [None])[0]
-    if not entry_txid:
-        print("ENTRY FAILED: no txid returned, cannot proceed")
+    entry_order_id = entry_result.get("result", {}).get("order_id")
+    if not entry_order_id:
+        print("ENTRY FAILED: no order_id returned, cannot proceed")
         return
 
-    # STEP 2: Poll briefly for the real fill price (market orders fill fast,
-    # but not always instantly - retry a few times before giving up)
     entry_price = None
     for attempt in range(5):
         time.sleep(1)
-        order_info = kraken.query_orders([entry_txid])
-        order_data = order_info.get("result", {}).get(entry_txid, {})
+        order_info = coinbase.query_orders([entry_order_id])
+        order_data = order_info.get("result", {}).get(entry_order_id, {})
         if order_data.get("status") == "closed":
             entry_price = float(order_data.get("price", 0))
             break
 
     if not entry_price:
         print("WARNING: Could not confirm real fill price after 5 attempts. "
-              f"Falling back to webhook close price ({webhook_close_price}) - "
-              "this may be HA-distorted if chart uses Heikin Ashi.")
+              f"Falling back to webhook close price ({webhook_close_price}).")
         entry_price = webhook_close_price
     else:
-        print(f"Confirmed REAL fill price from Kraken: {entry_price} "
+        print(f"Confirmed REAL fill price from Coinbase: {entry_price} "
               f"(webhook sent: {webhook_close_price})")
 
     if side == "LONG":
@@ -222,21 +210,19 @@ def open_trade(side, webhook_close_price, candle_time):
         tp = round(entry_price * (1 - TP_PCT), 1)
         sl = round(entry_price * (1 + SL_PCT), 1)
 
-    # STEP 3: Place TP order (standalone conditional)
-    tp_result = kraken.place_close_order(PAIR, exit_side, VOLUME, "take-profit", tp, LEVERAGE)
-    tp_txid = None
+    tp_result = coinbase.place_close_order(exit_side, contracts, "take-profit", tp, LEVERAGE)
+    tp_order_id = None
     if tp_result.get("error"):
         print(f"TP ORDER FAILED: {tp_result['error']}")
     else:
-        tp_txid = tp_result.get("result", {}).get("txid", [None])[0]
+        tp_order_id = tp_result.get("result", {}).get("order_id")
 
-    # STEP 3: Place SL order (standalone conditional)
-    sl_result = kraken.place_close_order(PAIR, exit_side, VOLUME, "stop-loss", sl, LEVERAGE)
-    sl_txid = None
+    sl_result = coinbase.place_close_order(exit_side, contracts, "stop-loss", sl, LEVERAGE)
+    sl_order_id = None
     if sl_result.get("error"):
         print(f"SL ORDER FAILED: {sl_result['error']}")
     else:
-        sl_txid = sl_result.get("result", {}).get("txid", [None])[0]
+        sl_order_id = sl_result.get("result", {}).get("order_id")
 
     with state_lock:
         state["in_trade"] = True
@@ -244,18 +230,18 @@ def open_trade(side, webhook_close_price, candle_time):
         state["entry_price"] = entry_price
         state["tp_price"] = tp
         state["sl_price"] = sl
-        state["tp_txid"] = tp_txid
-        state["sl_txid"] = sl_txid
+        state["tp_order_id"] = tp_order_id
+        state["sl_order_id"] = sl_order_id
         state["entry_time"] = candle_time
-        state["volume"] = VOLUME
+        state["contracts"] = contracts
 
     save_trade({
         "time": candle_time, "side": side, "entry_price": entry_price,
-        "tp_price": tp, "sl_price": sl, "tp_txid": tp_txid, "sl_txid": sl_txid,
+        "tp_price": tp, "sl_price": sl, "tp_order_id": tp_order_id, "sl_order_id": sl_order_id,
     })
     save_state()
-    print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} ({tp_txid}) | SL: {sl} ({sl_txid})")
-    print("NOTE: worker.py must poll tp_txid/sl_txid and cancel whichever doesn't fill.")
+    print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} ({tp_order_id}) | SL: {sl} ({sl_order_id})")
+    print("NOTE: worker.py must poll tp_order_id/sl_order_id and cancel whichever doesn't fill.")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -290,7 +276,6 @@ def webhook():
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
                         open_trade("LONG", close_price, now)
-                        # NOTE: anchor is NOT cleared here - confirmed rule tonight
                 elif value <= -ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value}
                     print(f"NEW GREEN anchor: {round(value, 2)}")
@@ -333,7 +318,7 @@ def load_trades():
         cur = conn.cursor()
         cur.execute("""
             SELECT time, side, entry_price, tp_price, sl_price, status, exit_price
-            FROM kraken_trades ORDER BY id DESC LIMIT 10
+            FROM coinbase_trades ORDER BY id DESC LIMIT 10
         """)
         rows = cur.fetchall()
         cur.close()
@@ -346,9 +331,9 @@ def load_trades():
 
 @app.route("/", methods=["GET"])
 def dashboard():
-    bal_result = kraken.get_balance()
-    balance_data = bal_result.get("result", {})
-    usd_balance = float(balance_data.get("ZUSD", 0))
+    bal_result = coinbase.get_balance()
+    balance_data = bal_result.get("result", {}).get("balance_summary", {})
+    usd_balance = float(balance_data.get("cfm_usd_balance", {}).get("value", 0))
 
     rows_html = ""
     for t in load_trades():
@@ -377,7 +362,7 @@ def dashboard():
     win_rate = f"{round(state['wins']/total*100)}%" if total > 0 else "-"
 
     html = (
-        "<!DOCTYPE html><html><head><title>TB-1000 Kraken</title>"
+        "<!DOCTYPE html><html><head><title>TB-1000 Coinbase</title>"
         "<meta http-equiv='refresh' content='10'>"
         "<style>"
         "body{background:#0d0d0d;color:#eee;font-family:sans-serif;padding:2rem;}"
@@ -390,9 +375,9 @@ def dashboard():
         "th,td{padding:8px;border-bottom:1px solid #333;text-align:left;font-size:13px;}"
         "th{color:#888;font-size:12px;}"
         "</style></head><body>"
-        "<h1>TB-1000 Kraken Bot (10x Leverage)</h1>"
+        "<h1>TB-1000 Coinbase Bot (10x Leverage)</h1>"
         "<div class='g'>"
-        f"<div class='c'><div class='l'>Kraken Balance (USD)</div><div class='v'>{fmt(usd_balance)}</div></div>"
+        f"<div class='c'><div class='l'>CFM Balance (USD)</div><div class='v'>{fmt(usd_balance)}</div></div>"
         f"<div class='c'><div class='l'>Wins</div><div class='v'>{state['wins']}</div></div>"
         f"<div class='c'><div class='l'>Losses</div><div class='v'>{state['losses']}</div></div>"
         f"<div class='c'><div class='l'>Win Rate</div><div class='v'>{win_rate}</div></div>"
@@ -406,7 +391,7 @@ def dashboard():
         "<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Status</th><th>Exit</th></tr>"
         + rows_html +
         "</table>"
-        "<p style='color:#555;font-size:11px;margin-top:1rem'>Auto-refreshes every 10 seconds | Live on Kraken</p>"
+        "<p style='color:#555;font-size:11px;margin-top:1rem'>Auto-refreshes every 10 seconds | Live on Coinbase</p>"
         "</body></html>"
     )
     return html
@@ -417,12 +402,8 @@ def ping():
     return "pong", 200
 
 
-# NOTE: NO price_watcher_loop or thread started here.
-# This is the race condition fix - ALL order monitoring/closing
-# happens in worker.py only, using Kraken's own order status
-# (via query_orders), not manual price polling.
-
 init_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+```
