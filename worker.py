@@ -1,22 +1,27 @@
-from flask import Flask, request, jsonify
+"""
+Coinbase Worker - Order Monitoring Service
+=============================================
+Same role as the old Kraken worker: the ONLY process that monitors and
+closes trades. app.py does NOT run a parallel price-watcher thread.
+This worker polls Coinbase's own order status via the API, since TP/SL
+orders are placed directly on the exchange (two separate orders, same
+constraint as Kraken - see coinbase_client.py).
+
+PROFIT-TIMEOUT RULE (unchanged from Kraken version):
+If a trade has been open longer than PROFIT_TIMEOUT_HOURS AND is
+currently sitting in profit, force-close it at market. If it's
+underwater at that point, let it keep running toward SL or eventual
+recovery - do NOT force a loss just because time ran out.
+"""
+
 import os
-import threading
 import time
 import psycopg2
 from datetime import datetime
 from coinbase_client import CoinbaseClient, PRODUCT_ID
 
-app = Flask(__name__)
-
-# ============ CONFIRMED RULES ============
-ANCHOR_LEVEL = 35
-TRIGGER_MAX_GREEN = 15
-TRIGGER_MIN_RED = -15
-TP_PCT = 0.0150            # 1.5% - updated from 0.50%, confirmed breakeven math
-SL_PCT = 0.0150            # 1.5% - updated from 0.50%
 LEVERAGE = 10
-BALANCE_SAFETY_PCT = 0.95  # same safety buffer concept as Kraken version
-CONTRACT_SIZE_BTC = 0.01   # nano BTC perp = 0.01 BTC per contract
+PROFIT_TIMEOUT_HOURS = float(os.environ.get("PROFIT_TIMEOUT_HOURS", 12))
 
 CDP_API_KEY_NAME = os.environ.get("CDP_API_KEY_NAME")
 CDP_API_KEY_PRIVATE_KEY = os.environ.get("CDP_API_KEY_PRIVATE_KEY")
@@ -24,37 +29,17 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 coinbase = CoinbaseClient(CDP_API_KEY_NAME, CDP_API_KEY_PRIVATE_KEY)
 
-state = {
-    "in_trade": False,
-    "trade_side": None,
-    "entry_price": None,
-    "tp_price": None,
-    "sl_price": None,
-    "tp_order_id": None,
-    "sl_order_id": None,
-    "entry_time": None,
-    "contracts": None,
-    "green_anchor": None,
-    "red_anchor": None,
-    "candle_count": 0,
-    "wins": 0,
-    "losses": 0,
-}
-state_lock = threading.Lock()
-
-
-def safe_float(val):
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
-
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
+    """
+    Creates the tables if they don't exist. Runs on every worker startup.
+    Only worker.py is deployed as a running service - app.py's init_db()
+    never executes on its own.
+    """
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -82,322 +67,147 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        print("Coinbase DB tables initialized")
+        print("Coinbase DB tables initialized (from worker.py)")
     except Exception as e:
         print(f"DB init error: {e}")
 
 
-def save_state():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        for key in ["in_trade", "trade_side", "entry_price", "tp_price",
-                    "sl_price", "tp_order_id", "sl_order_id", "entry_time",
-                    "contracts", "wins", "losses"]:
-            cur.execute("""
-                INSERT INTO coinbase_bot_state (key, value) VALUES (%s, %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """, (key, str(state.get(key))))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB save error: {e}")
+def load_bot_state():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT key, value FROM coinbase_bot_state")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
 
 
-def save_trade(t):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
+def update_bot_state(**kwargs):
+    conn = get_db()
+    cur = conn.cursor()
+    for key, val in kwargs.items():
         cur.execute("""
-            INSERT INTO coinbase_trades
-            (time, side, entry_price, tp_price, sl_price, tp_order_id, sl_order_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (t["time"], t["side"], t["entry_price"], t["tp_price"], t["sl_price"],
-              t["tp_order_id"], t["sl_order_id"], "OPEN"))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB save trade error: {e}")
+            INSERT INTO coinbase_bot_state (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (key, str(val)))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def calculate_contracts():
-    """
-    Calculates position size in WHOLE CONTRACTS using 95% of current
-    CFM futures balance at 10x leverage. Coinbase nano BTC perp contracts
-    are 0.01 BTC each - this is fundamentally different math from Kraken,
-    which used fractional BTC volume directly.
-
-    contracts = floor((balance_usd * BALANCE_SAFETY_PCT * leverage) / (price * CONTRACT_SIZE_BTC))
-    """
-    bal_result = coinbase.get_balance()
-    if bal_result.get("error"):
-        print(f"BALANCE CHECK FAILED: {bal_result['error']}")
-        return None
-    balance_data = bal_result.get("result", {}).get("balance_summary", {})
-    usd_balance = float(balance_data.get("cfm_usd_balance", {}).get("value", 0))
-    if usd_balance <= 0:
-        print(f"WARNING: CFM USD balance is {usd_balance} - nothing to trade with.")
-        return None
-
-    ticker_result = coinbase.get_ticker()
-    if ticker_result.get("error"):
-        print(f"Could not fetch current price for contract calc: {ticker_result['error']}")
-        return None
-    current_price = ticker_result["result"]["price"]
-
-    notional_target = usd_balance * BALANCE_SAFETY_PCT * LEVERAGE
-    contract_notional = current_price * CONTRACT_SIZE_BTC
-    contracts = int(notional_target // contract_notional)
-    print(f"Contract calc: balance=${usd_balance:.2f} | safety={BALANCE_SAFETY_PCT} | "
-          f"price=${current_price:.1f} | notional_target=${notional_target:.2f} | "
-          f"contracts={contracts}")
-    return contracts if contracts > 0 else None
+def close_trade_record(status, exit_price):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE coinbase_trades SET status=%s, exit_price=%s, closed_time=%s
+        WHERE id = (SELECT id FROM coinbase_trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1)
+    """, (status, exit_price, datetime.utcnow().isoformat()))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def open_trade(side, webhook_close_price, candle_time):
-    """
-    Places the real entry order on Coinbase, then queries for the ACTUAL
-    fill price. Same HA-distortion protection as the Kraken version -
-    signal comes from the chart, price math comes from the exchange.
-    """
-    entry_side = "buy" if side == "LONG" else "sell"
-    exit_side = "sell" if side == "LONG" else "buy"
-
-    contracts = calculate_contracts()
-    if not contracts:
-        print("TRADE ABORTED: could not calculate contract size from live balance.")
+def check_current_trade():
+    data = load_bot_state()
+    if data.get("in_trade") != "True":
         return
 
-    entry_result = coinbase.place_entry_order(entry_side, contracts, LEVERAGE)
-    if entry_result.get("error"):
-        print(f"ENTRY ORDER FAILED: {entry_result['error']}")
-        return
-    print(f"Entry order placed: {entry_result}")
+    tp_order_id = data.get("tp_order_id")
+    sl_order_id = data.get("sl_order_id")
+    side = data.get("trade_side")
+    entry_time_str = data.get("entry_time")
 
-    entry_order_id = entry_result.get("result", {}).get("order_id")
-    if not entry_order_id:
-        print("ENTRY FAILED: no order_id returned, cannot proceed")
+    if not tp_order_id or not sl_order_id or tp_order_id == "None" or sl_order_id == "None":
+        print("WARNING: Missing order IDs, cannot monitor this trade properly.")
         return
 
-    entry_price = None
-    for attempt in range(5):
-        time.sleep(1)
-        order_info = coinbase.query_orders([entry_order_id])
-        order_data = order_info.get("result", {}).get(entry_order_id, {})
-        if order_data.get("status") == "closed":
-            entry_price = float(order_data.get("price", 0))
-            break
+    result = coinbase.query_orders([tp_order_id, sl_order_id])
+    if result.get("error"):
+        print(f"Query orders error: {result['error']}")
+        return
 
-    if not entry_price:
-        print("WARNING: Could not confirm real fill price after 5 attempts. "
-              f"Falling back to webhook close price ({webhook_close_price}).")
-        entry_price = webhook_close_price
-    else:
-        print(f"Confirmed REAL fill price from Coinbase: {entry_price} "
-              f"(webhook sent: {webhook_close_price})")
+    orders = result.get("result", {})
+    tp_status = orders.get(tp_order_id, {}).get("status")
+    sl_status = orders.get(sl_order_id, {}).get("status")
 
-    if side == "LONG":
-        tp = round(entry_price * (1 + TP_PCT), 1)
-        sl = round(entry_price * (1 - SL_PCT), 1)
-    else:
-        tp = round(entry_price * (1 - TP_PCT), 1)
-        sl = round(entry_price * (1 + SL_PCT), 1)
+    print(f"Order check | TP ({tp_order_id}): {tp_status} | SL ({sl_order_id}): {sl_status}")
 
-    tp_result = coinbase.place_close_order(exit_side, contracts, "take-profit", tp, LEVERAGE)
-    tp_order_id = None
-    if tp_result.get("error"):
-        print(f"TP ORDER FAILED: {tp_result['error']}")
-    else:
-        tp_order_id = tp_result.get("result", {}).get("order_id")
+    if tp_status == "closed":
+        print("TP FILLED - cancelling SL order")
+        cancel_result = coinbase.cancel_order(sl_order_id)
+        print(f"Cancel SL result: {cancel_result}")
+        exit_price = orders.get(tp_order_id, {}).get("price", 0)
+        close_trade_record("WIN", exit_price)
+        wins = int(data.get("wins", 0)) + 1
+        update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
+                          sl_order_id=None, wins=wins)
+        print("TRADE CLOSED: WIN")
+        return
 
-    sl_result = coinbase.place_close_order(exit_side, contracts, "stop-loss", sl, LEVERAGE)
-    sl_order_id = None
-    if sl_result.get("error"):
-        print(f"SL ORDER FAILED: {sl_result['error']}")
-    else:
-        sl_order_id = sl_result.get("result", {}).get("order_id")
+    if sl_status == "closed":
+        print("SL FILLED - cancelling TP order")
+        cancel_result = coinbase.cancel_order(tp_order_id)
+        print(f"Cancel TP result: {cancel_result}")
+        exit_price = orders.get(sl_order_id, {}).get("price", 0)
+        close_trade_record("LOSS", exit_price)
+        losses = int(data.get("losses", 0)) + 1
+        update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
+                          sl_order_id=None, losses=losses)
+        print("TRADE CLOSED: LOSS")
+        return
 
-    with state_lock:
-        state["in_trade"] = True
-        state["trade_side"] = side
-        state["entry_price"] = entry_price
-        state["tp_price"] = tp
-        state["sl_price"] = sl
-        state["tp_order_id"] = tp_order_id
-        state["sl_order_id"] = sl_order_id
-        state["entry_time"] = candle_time
-        state["contracts"] = contracts
+    # Neither filled yet - check profit-timeout rule
+    if entry_time_str and entry_time_str != "None":
+        try:
+            entry_time = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M")
+            hours_open = (datetime.utcnow() - entry_time).total_seconds() / 3600
+        except Exception:
+            hours_open = 0
 
-    save_trade({
-        "time": candle_time, "side": side, "entry_price": entry_price,
-        "tp_price": tp, "sl_price": sl, "tp_order_id": tp_order_id, "sl_order_id": sl_order_id,
-    })
-    save_state()
-    print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} ({tp_order_id}) | SL: {sl} ({sl_order_id})")
-    print("NOTE: worker.py must poll tp_order_id/sl_order_id and cancel whichever doesn't fill.")
+        if hours_open >= PROFIT_TIMEOUT_HOURS:
+            ticker_result = coinbase.get_ticker()
+            if ticker_result.get("error"):
+                print(f"Could not fetch current price for timeout check: {ticker_result['error']}")
+                return
+            current_price = ticker_result["result"]["price"]
 
+            entry_price = float(data.get("entry_price", 0))
+            in_profit = (
+                (side == "LONG" and current_price > entry_price) or
+                (side == "SHORT" and current_price < entry_price)
+            )
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            return jsonify({"error": "invalid json"}), 400
-        dot = str(data.get("dot", "")).lower().strip()
-        value = safe_float(data.get("value", 0))
-        close_price = safe_float(data.get("close", None))
-        if value is None or close_price is None:
-            return jsonify({"error": "invalid payload"}), 400
-
-        print(f"Dot: {dot} | Value: {round(value, 2)} | Close: {close_price}")
-
-        with state_lock:
-            state["candle_count"] += 1
-            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
-            if dot == "green":
-                anchor = state["green_anchor"]
-                if anchor is None:
-                    if value <= -ANCHOR_LEVEL:
-                        state["green_anchor"] = {"value": value}
-                        print(f"GREEN anchor stored: {round(value, 2)}")
-                elif value > anchor["value"]:
-                    if value > TRIGGER_MAX_GREEN:
-                        print(f"GREEN trigger too high ({round(value,2)}) - anchor kept")
-                    elif state["in_trade"]:
-                        print("Already in trade - ignored")
-                    else:
-                        print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        open_trade("LONG", close_price, now)
-                elif value <= -ANCHOR_LEVEL:
-                    state["green_anchor"] = {"value": value}
-                    print(f"NEW GREEN anchor: {round(value, 2)}")
-
-            elif dot == "red":
-                anchor = state["red_anchor"]
-                if anchor is None:
-                    if value >= ANCHOR_LEVEL:
-                        state["red_anchor"] = {"value": value}
-                        print(f"RED anchor stored: {round(value, 2)}")
-                elif value < anchor["value"]:
-                    if value < TRIGGER_MIN_RED:
-                        print(f"RED trigger too low ({round(value,2)}) - anchor kept")
-                    elif state["in_trade"]:
-                        print("Already in trade - ignored")
-                    else:
-                        print(f"VALID SHORT! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        open_trade("SHORT", close_price, now)
-                elif value >= ANCHOR_LEVEL:
-                    state["red_anchor"] = {"value": value}
-                    print(f"NEW RED anchor: {round(value, 2)}")
-
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+            if in_profit:
+                print(f"PROFIT-TIMEOUT triggered after {hours_open:.1f}hrs - closing at market")
+                close_side = "sell" if side == "LONG" else "buy"
+                trade_contracts = data.get("contracts")
+                if not trade_contracts or trade_contracts == "None":
+                    print("WARNING: no saved contract count for this trade, cannot timeout-close safely.")
+                    return
+                coinbase.cancel_order(tp_order_id)
+                coinbase.cancel_order(sl_order_id)
+                close_result = coinbase.place_entry_order(close_side, int(trade_contracts), LEVERAGE)
+                print(f"Timeout close result: {close_result}")
+                close_trade_record("WIN", current_price)
+                wins = int(data.get("wins", 0)) + 1
+                update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
+                                  sl_order_id=None, wins=wins)
+                print("TRADE CLOSED: WIN (profit-timeout)")
+            else:
+                print(f"Trade open {hours_open:.1f}hrs, underwater - letting it ride toward SL")
 
 
-def fmt(n):
-    try:
-        return "${:,.2f}".format(float(n))
-    except (TypeError, ValueError):
-        return "$0.00"
+def worker_loop():
+    print("Coinbase worker started - polling every 5s")
+    while True:
+        try:
+            check_current_trade()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+        time.sleep(5)
 
-
-def load_trades():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT time, side, entry_price, tp_price, sl_price, status, exit_price
-            FROM coinbase_trades ORDER BY id DESC LIMIT 10
-        """)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
-    except Exception as e:
-        print(f"Load trades error: {e}")
-        return []
-
-
-@app.route("/", methods=["GET"])
-def dashboard():
-    bal_result = coinbase.get_balance()
-    balance_data = bal_result.get("result", {}).get("balance_summary", {})
-    usd_balance = float(balance_data.get("cfm_usd_balance", {}).get("value", 0))
-
-    rows_html = ""
-    for t in load_trades():
-        time_, side, entry, tp, sl, status, exit_price = t
-        color = "#00ff88" if status == "WIN" else "red" if status == "LOSS" else "#aaa"
-        exit_display = fmt(exit_price) if exit_price else "-"
-        rows_html += (
-            "<tr>"
-            f"<td>{time_}</td><td>{side}</td>"
-            f"<td>{fmt(entry)}</td>"
-            f"<td style='color:#00ff88'>{fmt(tp)}</td>"
-            f"<td style='color:red'>{fmt(sl)}</td>"
-            f"<td style='color:{color}'>{status}</td>"
-            f"<td>{exit_display}</td>"
-            "</tr>"
-        )
-    if not rows_html:
-        rows_html = "<tr><td colspan='7' style='color:#555'>Waiting for signals...</td></tr>"
-
-    green = str(round(state["green_anchor"]["value"], 1)) if state["green_anchor"] else "None"
-    red = str(round(state["red_anchor"]["value"], 1)) if state["red_anchor"] else "None"
-    trade = f"YES - {state['trade_side']}" if state["in_trade"] else "No"
-    tp_display = fmt(state["tp_price"]) if state["tp_price"] else "-"
-    sl_display = fmt(state["sl_price"]) if state["sl_price"] else "-"
-    total = state["wins"] + state["losses"]
-    win_rate = f"{round(state['wins']/total*100)}%" if total > 0 else "-"
-
-    html = (
-        "<!DOCTYPE html><html><head><title>TB-1000 Coinbase</title>"
-        "<meta http-equiv='refresh' content='10'>"
-        "<style>"
-        "body{background:#0d0d0d;color:#eee;font-family:sans-serif;padding:2rem;}"
-        "h1{color:#00ff88;}"
-        ".g{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin:1rem 0;}"
-        ".c{background:#1a1a1a;border-radius:8px;padding:1rem;}"
-        ".l{font-size:12px;color:#888;margin-bottom:4px;}"
-        ".v{font-size:20px;font-weight:bold;color:#00ff88;}"
-        "table{width:100%;border-collapse:collapse;margin-top:1rem;}"
-        "th,td{padding:8px;border-bottom:1px solid #333;text-align:left;font-size:13px;}"
-        "th{color:#888;font-size:12px;}"
-        "</style></head><body>"
-        "<h1>TB-1000 Coinbase Bot (10x Leverage)</h1>"
-        "<div class='g'>"
-        f"<div class='c'><div class='l'>CFM Balance (USD)</div><div class='v'>{fmt(usd_balance)}</div></div>"
-        f"<div class='c'><div class='l'>Wins</div><div class='v'>{state['wins']}</div></div>"
-        f"<div class='c'><div class='l'>Losses</div><div class='v'>{state['losses']}</div></div>"
-        f"<div class='c'><div class='l'>Win Rate</div><div class='v'>{win_rate}</div></div>"
-        f"<div class='c'><div class='l'>In Trade</div><div class='v'>{trade}</div></div>"
-        f"<div class='c'><div class='l'>Live TP</div><div class='v'>{tp_display}</div></div>"
-        f"<div class='c'><div class='l'>Live SL</div><div class='v'>{sl_display}</div></div>"
-        f"<div class='c'><div class='l'>Green Anchor</div><div class='v'>{green}</div></div>"
-        f"<div class='c'><div class='l'>Red Anchor</div><div class='v'>{red}</div></div>"
-        f"<div class='c'><div class='l'>Leverage</div><div class='v'>{LEVERAGE}x</div></div>"
-        "</div>"
-        "<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Status</th><th>Exit</th></tr>"
-        + rows_html +
-        "</table>"
-        "<p style='color:#555;font-size:11px;margin-top:1rem'>Auto-refreshes every 10 seconds | Live on Coinbase</p>"
-        "</body></html>"
-    )
-    return html
-
-
-@app.route("/ping", methods=["GET"])
-def ping():
-    return "pong", 200
-
-
-init_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    init_db()
+    worker_loop()
