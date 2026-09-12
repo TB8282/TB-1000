@@ -327,7 +327,7 @@ def load_trades():
 @app.route("/", methods=["GET"])
 def dashboard():
     bal_result = coinbase.get_balance()
-    balance_data = bal_result.get("result", {}).get("balance_summary", {})
+    balance_data = (bal_result.get("result") or {}).get("balance_summary", {})
     usd_balance = float(balance_data.get("cfm_usd_balance", {}).get("value", 0))
 
     rows_html = ""
