@@ -467,6 +467,25 @@ def ping():
     return "pong", 200
 
 
+@app.route("/debug", methods=["GET"])
+def debug():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM coinbase_bot_state ORDER BY key")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        db_state = {r[0]: r[1] for r in rows}
+    except Exception as e:
+        db_state = {"error": str(e)}
+
+    return jsonify({
+        "db_state": db_state,
+        "in_memory_state": {k: v for k, v in state.items() if k not in ("green_anchor", "red_anchor")}
+    })
+
+
 init_db()
 load_state()
 
