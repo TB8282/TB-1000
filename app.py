@@ -399,7 +399,7 @@ def load_trades():
 def dashboard():
     bal_result = coinbase.get_balance()
     balance_data = (bal_result.get("result") or {}).get("balance_summary", {})
-    cbi_balance = float(balance_data.get("cbi_usd_balance", {}).get("value", 0))
+    cbi_balance = float(balance_data.get("futures_buying_power", {}).get("value", 0))
 
     rows_html = ""
     for t in load_trades():
@@ -443,7 +443,7 @@ def dashboard():
         "</style></head><body>"
         "<h1>TB-1000 Coinbase Bot (10x Leverage)</h1>"
         "<div class='g'>"
-        f"<div class='c'><div class='l'>Spot Balance (USD)</div><div class='v'>{fmt(cbi_balance)}</div></div>"
+        f"<div class='c'><div class='l'>Available Balance (USD)</div><div class='v'>{fmt(cbi_balance)}</div></div>"
         f"<div class='c'><div class='l'>Wins</div><div class='v'>{state['wins']}</div></div>"
         f"<div class='c'><div class='l'>Losses</div><div class='v'>{state['losses']}</div></div>"
         f"<div class='c'><div class='l'>Win Rate</div><div class='v'>{win_rate}</div></div>"
