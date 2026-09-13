@@ -341,6 +341,7 @@ def webhook():
                         print("Already in trade - ignored")
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
+                        state["green_anchor"] = {"value": value}
                         open_trade("LONG", close_price, now)
                 elif value <= -ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value}
@@ -359,6 +360,7 @@ def webhook():
                         print("Already in trade - ignored")
                     else:
                         print(f"VALID SHORT! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
+                        state["red_anchor"] = {"value": value}
                         open_trade("SHORT", close_price, now)
                 elif value >= ANCHOR_LEVEL:
                     state["red_anchor"] = {"value": value}
