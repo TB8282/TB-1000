@@ -468,6 +468,54 @@ def ping():
     return "pong", 200
 
 
+def close_trade_record(status, exit_price):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE coinbase_trades SET status=%s, exit_price=%s, closed_time=%s
+        WHERE id = (SELECT id FROM coinbase_trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1)
+    """, (status, exit_price, datetime.utcnow().isoformat()))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+@app.route("/close_manual", methods=["GET"])
+def close_manual():
+    """
+    Records a trade that was closed manually on the exchange (bracket
+    order filled) but which the bot's automated worker never saw
+    because it lacked real order IDs to monitor. Recovery tool.
+    Visit as a URL, e.g.:
+    /close_manual?status=LOSS&exit_price=76615
+    status must be WIN, LOSS, or TIE.
+    """
+    status = request.args.get("status", "").upper()
+    exit_price = safe_float(request.args.get("exit_price"))
+    if status not in ("WIN", "LOSS", "TIE") or exit_price is None:
+        return jsonify({"error": "required params: status (WIN/LOSS/TIE), exit_price"}), 400
+
+    close_trade_record(status, exit_price)
+
+    with state_lock:
+        if status == "WIN":
+            state["wins"] = state.get("wins", 0) + 1
+        elif status == "LOSS":
+            state["losses"] = state.get("losses", 0) + 1
+        state["in_trade"] = False
+        state["trade_side"] = None
+        state["entry_price"] = None
+        state["tp_price"] = None
+        state["sl_price"] = None
+        state["tp_order_id"] = None
+        state["sl_order_id"] = None
+        state["entry_time"] = None
+        state["contracts"] = None
+
+    save_state()
+    return jsonify({"status": "closed", "state": {k: v for k, v in state.items() if k not in ("green_anchor", "red_anchor")}})
+
+
 @app.route("/resync", methods=["GET"])
 def resync():
     """
