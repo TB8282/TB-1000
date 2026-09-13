@@ -468,28 +468,32 @@ def ping():
     return "pong", 200
 
 
-@app.route("/resync", methods=["POST"])
+@app.route("/resync", methods=["GET"])
 def resync():
     """
     Manually re-syncs state to reflect a real trade already open on Coinbase
     but missing from the DB/in-memory state (recovery tool, not normal flow).
-    Call with JSON body: {"side": "LONG", "entry_price": 77205, "tp_price": 77785,
-    "sl_price": 76625, "contracts": 1, "entry_time": "2026-09-12 20:15"}
+    Visit as a URL with query params, e.g.:
+    /resync?side=LONG&entry_price=77205&tp_price=77785&sl_price=76625&contracts=1&entry_time=2026-09-12 20:15
     """
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "invalid json"}), 400
+    side = request.args.get("side")
+    entry_price = safe_float(request.args.get("entry_price"))
+    tp_price = safe_float(request.args.get("tp_price"))
+    sl_price = safe_float(request.args.get("sl_price"))
+    contracts = request.args.get("contracts")
+    entry_time = request.args.get("entry_time")
+
+    if not side or entry_price is None:
+        return jsonify({"error": "missing required params: side, entry_price"}), 400
 
     with state_lock:
         state["in_trade"] = True
-        state["trade_side"] = data.get("side")
-        state["entry_price"] = safe_float(data.get("entry_price"))
-        state["tp_price"] = safe_float(data.get("tp_price"))
-        state["sl_price"] = safe_float(data.get("sl_price"))
-        state["contracts"] = data.get("contracts")
-        state["entry_time"] = data.get("entry_time")
-        state["tp_order_id"] = data.get("tp_order_id")
-        state["sl_order_id"] = data.get("sl_order_id")
+        state["trade_side"] = side
+        state["entry_price"] = entry_price
+        state["tp_price"] = tp_price
+        state["sl_price"] = sl_price
+        state["contracts"] = contracts
+        state["entry_time"] = entry_time
 
     save_state()
     return jsonify({"status": "resynced", "state": {k: v for k, v in state.items() if k not in ("green_anchor", "red_anchor")}})
