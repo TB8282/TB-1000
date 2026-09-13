@@ -154,8 +154,9 @@ def save_state():
         conn.commit()
         cur.close()
         conn.close()
+        print(f"State saved to DB OK: in_trade={state.get('in_trade')}", flush=True)
     except Exception as e:
-        print(f"DB save error: {e}")
+        print(f"DB save error: {e}", flush=True)
 
 
 def save_trade(t):
@@ -465,6 +466,33 @@ def dashboard():
 @app.route("/ping", methods=["GET"])
 def ping():
     return "pong", 200
+
+
+@app.route("/resync", methods=["POST"])
+def resync():
+    """
+    Manually re-syncs state to reflect a real trade already open on Coinbase
+    but missing from the DB/in-memory state (recovery tool, not normal flow).
+    Call with JSON body: {"side": "LONG", "entry_price": 77205, "tp_price": 77785,
+    "sl_price": 76625, "contracts": 1, "entry_time": "2026-09-12 20:15"}
+    """
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "invalid json"}), 400
+
+    with state_lock:
+        state["in_trade"] = True
+        state["trade_side"] = data.get("side")
+        state["entry_price"] = safe_float(data.get("entry_price"))
+        state["tp_price"] = safe_float(data.get("tp_price"))
+        state["sl_price"] = safe_float(data.get("sl_price"))
+        state["contracts"] = data.get("contracts")
+        state["entry_time"] = data.get("entry_time")
+        state["tp_order_id"] = data.get("tp_order_id")
+        state["sl_order_id"] = data.get("sl_order_id")
+
+    save_state()
+    return jsonify({"status": "resynced", "state": {k: v for k, v in state.items() if k not in ("green_anchor", "red_anchor")}})
 
 
 @app.route("/debug", methods=["GET"])
