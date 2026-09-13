@@ -269,11 +269,11 @@ def open_trade(side, webhook_close_price, candle_time):
               f"(webhook sent: {webhook_close_price})")
 
     if side == "LONG":
-        tp = round(entry_price * (1 + TP_PCT), 1)
-        sl = round(entry_price * (1 - SL_PCT), 1)
+        tp = round(entry_price * (1 + TP_PCT))
+        sl = round(entry_price * (1 - SL_PCT))
     else:
-        tp = round(entry_price * (1 - TP_PCT), 1)
-        sl = round(entry_price * (1 + SL_PCT), 1)
+        tp = round(entry_price * (1 - TP_PCT))
+        sl = round(entry_price * (1 + SL_PCT))
 
     tp_result = coinbase.place_close_order(exit_side, contracts, "take-profit", tp, LEVERAGE)
     tp_order_id = None
