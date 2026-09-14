@@ -31,6 +31,7 @@ state = {
     "in_trade": False,
     "trade_side": None,
     "entry_price": None,
+    "entry_order_id": None,
     "tp_price": None,
     "sl_price": None,
     "tp_order_id": None,
@@ -117,6 +118,8 @@ def load_state():
                 state["trade_side"] = None if db_values["trade_side"] == "None" else db_values["trade_side"]
             if "entry_price" in db_values:
                 state["entry_price"] = safe_float(db_values["entry_price"])
+            if "entry_order_id" in db_values:
+                state["entry_order_id"] = None if db_values["entry_order_id"] == "None" else db_values["entry_order_id"]
             if "tp_price" in db_values:
                 state["tp_price"] = safe_float(db_values["tp_price"])
             if "sl_price" in db_values:
@@ -144,7 +147,7 @@ def save_state():
     try:
         conn = get_db()
         cur = conn.cursor()
-        for key in ["in_trade", "trade_side", "entry_price", "tp_price",
+        for key in ["in_trade", "trade_side", "entry_price", "entry_order_id", "tp_price",
                     "sl_price", "tp_order_id", "sl_order_id", "entry_time",
                     "contracts", "wins", "losses"]:
             cur.execute("""
@@ -232,6 +235,14 @@ def open_trade(side, webhook_close_price, candle_time):
     Places the real entry order on Coinbase, then queries for the ACTUAL
     fill price. Same HA-distortion protection as the Kraken version -
     signal comes from the chart, price math comes from the exchange.
+
+    FIX (Sep 14 2026): every order ID is now saved to the DB immediately
+    after Coinbase returns it - BEFORE any further slow/blocking code
+    runs (fill-price polling, the next order call, etc). Previously all
+    saves were batched at the very end of this function, so a process
+    kill partway through (as happened Sep 14 ~9:00 AM) could leave a
+    real, fully-protected position on Coinbase with zero record of it
+    in the DB, and worker.py had no order IDs to monitor.
     """
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
@@ -252,6 +263,25 @@ def open_trade(side, webhook_close_price, candle_time):
         print("ENTRY FAILED: no order_id returned, cannot proceed")
         return
 
+    # SAVE IMMEDIATELY - before the fill-price polling loop below, which
+    # blocks for up to 5 seconds. If the process dies during that loop,
+    # the DB will already show in_trade=True and the real entry_order_id,
+    # instead of the bot believing it's flat while a position sits live
+    # and unprotected on Coinbase.
+    with state_lock:
+        state["in_trade"] = True
+        state["trade_side"] = side
+        state["entry_price"] = webhook_close_price
+        state["entry_order_id"] = entry_order_id
+        state["tp_price"] = None
+        state["sl_price"] = None
+        state["tp_order_id"] = None
+        state["sl_order_id"] = None
+        state["entry_time"] = candle_time
+        state["contracts"] = contracts
+    save_state()
+    print(f"Entry order_id saved to DB immediately: {entry_order_id}")
+
     entry_price = None
     for attempt in range(5):
         time.sleep(1)
@@ -268,6 +298,9 @@ def open_trade(side, webhook_close_price, candle_time):
     else:
         print(f"Confirmed REAL fill price from Coinbase: {entry_price} "
               f"(webhook sent: {webhook_close_price})")
+        with state_lock:
+            state["entry_price"] = entry_price
+        save_state()
 
     if side == "LONG":
         tp = round(entry_price * (1 + TP_PCT) / 5) * 5
@@ -282,6 +315,12 @@ def open_trade(side, webhook_close_price, candle_time):
         print(f"TP ORDER FAILED: {tp_result['error']}")
     else:
         tp_order_id = tp_result.get("result", {}).get("order_id")
+        # SAVE IMMEDIATELY - before the SL order call below.
+        with state_lock:
+            state["tp_price"] = tp
+            state["tp_order_id"] = tp_order_id
+        save_state()
+        print(f"TP order_id saved to DB immediately: {tp_order_id}")
 
     sl_result = coinbase.place_close_order(exit_side, contracts, "stop-loss", sl, LEVERAGE)
     sl_order_id = None
@@ -289,23 +328,19 @@ def open_trade(side, webhook_close_price, candle_time):
         print(f"SL ORDER FAILED: {sl_result['error']}")
     else:
         sl_order_id = sl_result.get("result", {}).get("order_id")
-
-    with state_lock:
-        state["in_trade"] = True
-        state["trade_side"] = side
-        state["entry_price"] = entry_price
-        state["tp_price"] = tp
-        state["sl_price"] = sl
-        state["tp_order_id"] = tp_order_id
-        state["sl_order_id"] = sl_order_id
-        state["entry_time"] = candle_time
-        state["contracts"] = contracts
+        # SAVE IMMEDIATELY - this is the exact point where the Sep 14
+        # crash lost data: both orders existed on Coinbase but neither
+        # ID had reached the DB yet.
+        with state_lock:
+            state["sl_price"] = sl
+            state["sl_order_id"] = sl_order_id
+        save_state()
+        print(f"SL order_id saved to DB immediately: {sl_order_id}")
 
     save_trade({
         "time": candle_time, "side": side, "entry_price": entry_price,
         "tp_price": tp, "sl_price": sl, "tp_order_id": tp_order_id, "sl_order_id": sl_order_id,
     })
-    save_state()
     print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} ({tp_order_id}) | SL: {sl} ({sl_order_id})")
     print("NOTE: worker.py must poll tp_order_id/sl_order_id and cancel whichever doesn't fill.")
 
@@ -507,6 +542,7 @@ def close_manual():
         state["in_trade"] = False
         state["trade_side"] = None
         state["entry_price"] = None
+        state["entry_order_id"] = None
         state["tp_price"] = None
         state["sl_price"] = None
         state["tp_order_id"] = None
