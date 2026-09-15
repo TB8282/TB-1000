@@ -185,33 +185,26 @@ def calculate_contracts(entry_side):
     requirement from Coinbase's own preview_order endpoint - NOT a hardcoded
     leverage assumption.
 
-    CONFIRMED LIVE (Sep 12, 2026): actual leverage on a real filled order
-    was 4.1x outside the 8am-4pm ET intraday window, not the assumed 10x.
-    Coinbase's margin requirement changes between intraday and overnight
-    windows, so a fixed LEVERAGE constant cannot be trusted for sizing.
-
-    This previews a 1-contract order (at requested leverage=LEVERAGE) to
-    read back order_margin_total - the REAL dollar margin Coinbase would
-    actually require right now - then sizes the real order off of that.
-
-    contracts = floor((balance_usd * BALANCE_SAFETY_PCT) / margin_per_contract)
+    TIMING INSTRUMENTATION ADDED (Sep 15 2026): every Coinbase API call in
+    this function is now wrapped with elapsed-time logging, to find which
+    specific call is stalling and causing the ongoing SystemExit/worker
+    timeout crashes even after raising Gunicorn's --timeout to 120s.
     """
+    t0 = time.time()
     bal_result = coinbase.get_balance()
+    print(f"TIMING: get_balance() took {time.time() - t0:.2f}s", flush=True)
     if bal_result.get("error"):
         print(f"BALANCE CHECK FAILED: {bal_result['error']}")
         return None
     balance_data = bal_result.get("result", {}).get("balance_summary", {})
-    # NOTE: cfm_usd_balance is correctly $0 when flat - Coinbase only sweeps
-    # cash from the CBI spot account into CFM at the moment an order actually
-    # needs margin (confirmed via Coinbase docs, Sep 12 2026). Checking
-    # cbi_usd_balance instead reflects the real spendable balance that will
-    # auto-transfer when this order is placed.
     usd_balance = float(balance_data.get("cbi_usd_balance", {}).get("value", 0))
     if usd_balance <= 0:
         print(f"WARNING: CBI USD balance is {usd_balance} - nothing to trade with.")
         return None
 
+    t1 = time.time()
     preview_result = coinbase.place_entry_order(entry_side, 1, LEVERAGE, validate=True)
+    print(f"TIMING: preview_order() (margin check) took {time.time() - t1:.2f}s", flush=True)
     if preview_result.get("error"):
         print(f"MARGIN PREVIEW FAILED: {preview_result['error']}")
         return None
@@ -227,6 +220,7 @@ def calculate_contracts(entry_side):
     print(f"Contract calc: balance=${usd_balance:.2f} | safety={BALANCE_SAFETY_PCT} | "
           f"margin_per_contract=${margin_per_contract:.2f} (LIVE preview) | "
           f"available_for_trading=${available_for_trading:.2f} | contracts={contracts}")
+    print(f"TIMING: calculate_contracts() TOTAL took {time.time() - t0:.2f}s", flush=True)
     return contracts if contracts > 0 else None
 
 
@@ -236,23 +230,31 @@ def open_trade(side, webhook_close_price, candle_time):
     fill price. Same HA-distortion protection as the Kraken version -
     signal comes from the chart, price math comes from the exchange.
 
-    FIX (Sep 14 2026): every order ID is now saved to the DB immediately
+    FIX (Sep 14 2026): every order ID is saved to the DB immediately
     after Coinbase returns it - BEFORE any further slow/blocking code
-    runs (fill-price polling, the next order call, etc). Previously all
-    saves were batched at the very end of this function, so a process
-    kill partway through (as happened Sep 14 ~9:00 AM) could leave a
-    real, fully-protected position on Coinbase with zero record of it
-    in the DB, and worker.py had no order IDs to monitor.
+    runs (fill-price polling, the next order call, etc).
+
+    TIMING INSTRUMENTATION ADDED (Sep 15 2026): wraps every remaining
+    Coinbase API call (entry order, fill-price poll, TP order, SL order)
+    with elapsed-time logging, plus a running total from function start,
+    to find where the SystemExit/worker-timeout crash is actually
+    happening - it is still occurring even with Gunicorn's timeout
+    raised to 120s, so something is stalling longer than expected.
     """
+    func_start = time.time()
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
 
     contracts = calculate_contracts(entry_side)
+    print(f"TIMING: [elapsed {time.time() - func_start:.2f}s] after calculate_contracts()", flush=True)
     if not contracts:
         print("TRADE ABORTED: could not calculate contract size from live balance/margin.")
         return
 
+    t_entry = time.time()
     entry_result = coinbase.place_entry_order(entry_side, contracts, LEVERAGE)
+    print(f"TIMING: place_entry_order() took {time.time() - t_entry:.2f}s "
+          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
     if entry_result.get("error"):
         print(f"ENTRY ORDER FAILED: {entry_result['error']}")
         return
@@ -263,11 +265,8 @@ def open_trade(side, webhook_close_price, candle_time):
         print("ENTRY FAILED: no order_id returned, cannot proceed")
         return
 
-    # SAVE IMMEDIATELY - before the fill-price polling loop below, which
-    # blocks for up to 5 seconds. If the process dies during that loop,
-    # the DB will already show in_trade=True and the real entry_order_id,
-    # instead of the bot believing it's flat while a position sits live
-    # and unprotected on Coinbase.
+    # SAVE IMMEDIATELY - before the fill-price polling loop below.
+    t_save1 = time.time()
     with state_lock:
         state["in_trade"] = True
         state["trade_side"] = side
@@ -280,9 +279,12 @@ def open_trade(side, webhook_close_price, candle_time):
         state["entry_time"] = candle_time
         state["contracts"] = contracts
     save_state()
+    print(f"TIMING: entry save_state() took {time.time() - t_save1:.2f}s "
+          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
     print(f"Entry order_id saved to DB immediately: {entry_order_id}")
 
     entry_price = None
+    t_poll = time.time()
     for attempt in range(5):
         time.sleep(1)
         order_info = coinbase.query_orders([entry_order_id])
@@ -290,6 +292,8 @@ def open_trade(side, webhook_close_price, candle_time):
         if order_data.get("status") == "closed":
             entry_price = float(order_data.get("price", 0))
             break
+    print(f"TIMING: fill-price poll loop took {time.time() - t_poll:.2f}s "
+          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
 
     if not entry_price:
         print("WARNING: Could not confirm real fill price after 5 attempts. "
@@ -309,28 +313,30 @@ def open_trade(side, webhook_close_price, candle_time):
         tp = round(entry_price * (1 - TP_PCT) / 5) * 5
         sl = round(entry_price * (1 + SL_PCT) / 5) * 5
 
+    t_tp = time.time()
     tp_result = coinbase.place_close_order(exit_side, contracts, "take-profit", tp, LEVERAGE)
+    print(f"TIMING: place_close_order(TP) took {time.time() - t_tp:.2f}s "
+          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
     tp_order_id = None
     if tp_result.get("error"):
         print(f"TP ORDER FAILED: {tp_result['error']}")
     else:
         tp_order_id = tp_result.get("result", {}).get("order_id")
-        # SAVE IMMEDIATELY - before the SL order call below.
         with state_lock:
             state["tp_price"] = tp
             state["tp_order_id"] = tp_order_id
         save_state()
         print(f"TP order_id saved to DB immediately: {tp_order_id}")
 
+    t_sl = time.time()
     sl_result = coinbase.place_close_order(exit_side, contracts, "stop-loss", sl, LEVERAGE)
+    print(f"TIMING: place_close_order(SL) took {time.time() - t_sl:.2f}s "
+          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
     sl_order_id = None
     if sl_result.get("error"):
         print(f"SL ORDER FAILED: {sl_result['error']}")
     else:
         sl_order_id = sl_result.get("result", {}).get("order_id")
-        # SAVE IMMEDIATELY - this is the exact point where the Sep 14
-        # crash lost data: both orders existed on Coinbase but neither
-        # ID had reached the DB yet.
         with state_lock:
             state["sl_price"] = sl
             state["sl_order_id"] = sl_order_id
@@ -342,6 +348,7 @@ def open_trade(side, webhook_close_price, candle_time):
         "tp_price": tp, "sl_price": sl, "tp_order_id": tp_order_id, "sl_order_id": sl_order_id,
     })
     print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} ({tp_order_id}) | SL: {sl} ({sl_order_id})")
+    print(f"TIMING: open_trade() TOTAL took {time.time() - func_start:.2f}s", flush=True)
     print("NOTE: worker.py must poll tp_order_id/sl_order_id and cancel whichever doesn't fill.")
 
 
