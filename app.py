@@ -372,6 +372,20 @@ def webhook():
 
         print(f"Dot: {dot} | Value: {round(value, 2)} | Close: {close_price}")
 
+        # FIX (Sep 16 2026): open_trade() must NEVER be called while
+        # state_lock is held. state_lock is a plain threading.Lock (not
+        # reentrant) - open_trade() itself acquires state_lock internally
+        # to save entry/TP/SL state. Calling open_trade() from inside this
+        # same "with state_lock:" block caused every single trade to hang
+        # forever at open_trade()'s "with state_lock:" line, waiting on a
+        # lock this same thread already held. Gunicorn's worker-timeout
+        # (30s originally, 120s after that change) was the only thing that
+        # ever ended it - explaining every SystemExit/WORKER TIMEOUT crash
+        # traced back to that exact line across every incident this week.
+        # Fix: decide inside the lock (cheap, in-memory), release the lock,
+        # THEN call open_trade() if a valid signal fired.
+        trade_side_to_open = None
+
         with state_lock:
             state["candle_count"] += 1
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
@@ -390,7 +404,7 @@ def webhook():
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
                         state["green_anchor"] = {"value": value}
-                        open_trade("LONG", close_price, now)
+                        trade_side_to_open = "LONG"
                 elif value <= -ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value}
                     print(f"NEW GREEN anchor: {round(value, 2)}")
@@ -409,10 +423,14 @@ def webhook():
                     else:
                         print(f"VALID SHORT! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
                         state["red_anchor"] = {"value": value}
-                        open_trade("SHORT", close_price, now)
+                        trade_side_to_open = "SHORT"
                 elif value >= ANCHOR_LEVEL:
                     state["red_anchor"] = {"value": value}
                     print(f"NEW RED anchor: {round(value, 2)}")
+
+        # state_lock is now RELEASED. Safe for open_trade() to acquire it.
+        if trade_side_to_open:
+            open_trade(trade_side_to_open, close_price, now)
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
