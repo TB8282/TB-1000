@@ -197,9 +197,15 @@ def calculate_contracts(entry_side):
         print(f"BALANCE CHECK FAILED: {bal_result['error']}")
         return None
     balance_data = bal_result.get("result", {}).get("balance_summary", {})
-    usd_balance = float(balance_data.get("cbi_usd_balance", {}).get("value", 0))
+    # FIX (Sep 15 2026): cbi_usd_balance only reflects the SPOT account and
+    # misses cash already sitting in the Derivatives/CFM account (confirmed
+    # via Coinbase's own API docs and the order form's "Available (USD +
+    # USDC)" figure). futures_buying_power is Coinbase's own documented
+    # "amount of cash balance available to trade CFM futures" - the correct
+    # combined number, matching what the order form itself shows.
+    usd_balance = float(balance_data.get("futures_buying_power", {}).get("value", 0))
     if usd_balance <= 0:
-        print(f"WARNING: CBI USD balance is {usd_balance} - nothing to trade with.")
+        print(f"WARNING: futures_buying_power is {usd_balance} - nothing to trade with.")
         return None
 
     t1 = time.time()
