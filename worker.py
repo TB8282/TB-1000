@@ -3,24 +3,36 @@ Coinbase Worker - Order Monitoring Service
 =============================================
 Same role as the old Kraken worker: the ONLY process that monitors and
 closes trades. app.py does NOT run a parallel price-watcher thread.
-This worker polls Coinbase's own order status via the API, since TP/SL
-orders are placed directly on the exchange (two separate orders, same
-constraint as Kraken - see coinbase_client.py).
+This worker polls Coinbase's own order status via the API.
 
-SCRATCH RULE (new):
+FIX (Sep 17 2026): app.py now attaches TP/SL to the entry order as a
+single native Coinbase bracket (trigger_bracket_gtc) instead of placing
+two separate follow-up orders. tp_order_id and sl_order_id in the DB
+are now the SAME id (the bracket's own order id) - there is only one
+order to poll, not two.
+
+Because of that, this worker can no longer tell WIN from LOSS by
+"which of the two order IDs closed" (there's only one ID now covering
+both outcomes). Instead: once that single order shows closed/filled,
+WIN/LOSS is determined by comparing the account's current
+futures_buying_power to balance_before_trade (saved by app.py the
+moment the trade opened). Balance up = WIN, balance down = LOSS.
+This is a simpler, more certain signal than trying to infer which leg
+of a merged bracket triggered, at the cost of being slightly less
+precise about the exact fill price recorded (uses the bracket order's
+own reported price for the trade record, balance comparison only
+decides WIN/LOSS).
+
+SCRATCH RULE (unchanged):
 Once a trade's unrealized profit reaches SCRATCH_ARM_PCT (0.5%), the
 trade is "armed." If price then retraces back to the entry price while
-armed, the trade is force-closed flat (a scratch) - cancels both TP/SL
-orders and closes at market. The real -0.75% SL stays live on the
-exchange the entire time as a hard floor in case of a sudden wick;
-this scratch logic is an independent watcher on top of it, not a
-replacement for it.
+armed, the trade is force-closed flat (a scratch) - cancels the open
+bracket order and closes at market.
 
-TIE RULE (changed from old PROFIT-TIMEOUT rule):
+TIE RULE (unchanged):
 If a trade has been open longer than PROFIT_TIMEOUT_HOURS, it is
 force-closed at market UNCONDITIONALLY - win, loss, or flat - and
-logged as a TIE. This replaces the old behavior of only closing if
-in profit and letting losers ride toward SL.
+logged as a TIE.
 """
 
 import os
@@ -117,20 +129,31 @@ def close_trade_record(status, exit_price):
     conn.close()
 
 
-def force_close_at_market(data, tp_order_id, sl_order_id, side, trade_contracts, status_label):
+def get_current_balance():
     """
-    Shared close path for both SCRATCH and TIE outcomes: cancels both
-    open TP/SL orders, closes the position at market, records the
-    result, and resets bot state. status_label is "SCRATCH" or "TIE".
+    Returns current futures_buying_power as a float, or None on error.
+    Used to compare against balance_before_trade to determine WIN/LOSS.
+    """
+    bal_result = coinbase.get_balance()
+    if bal_result.get("error"):
+        print(f"Balance check error: {bal_result['error']}")
+        return None
+    balance_data = bal_result.get("result", {}).get("balance_summary", {})
+    return float(balance_data.get("futures_buying_power", {}).get("value", 0))
+
+
+def force_close_at_market(data, bracket_order_id, side, trade_contracts, status_label):
+    """
+    Shared close path for both SCRATCH and TIE outcomes: cancels the open
+    bracket order, closes the position at market, records the result
+    (SCRATCH/TIE are their own labels, not WIN/LOSS, so balance comparison
+    is not needed here), and resets bot state.
     """
     close_side = "sell" if side == "LONG" else "buy"
 
-    if tp_order_id and tp_order_id != "None":
-        cancel_tp = coinbase.cancel_order(tp_order_id)
-        print(f"Cancel TP result: {cancel_tp}")
-    if sl_order_id and sl_order_id != "None":
-        cancel_sl = coinbase.cancel_order(sl_order_id)
-        print(f"Cancel SL result: {cancel_sl}")
+    if bracket_order_id and bracket_order_id != "None":
+        cancel_result = coinbase.cancel_order(bracket_order_id)
+        print(f"Cancel bracket order result: {cancel_result}")
 
     if not trade_contracts or trade_contracts == "None":
         print(f"WARNING: no saved contract count, cannot {status_label}-close safely.")
@@ -144,7 +167,8 @@ def force_close_at_market(data, tp_order_id, sl_order_id, side, trade_contracts,
 
     close_trade_record(status_label, exit_price)
     update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
-                      sl_order_id=None, scratch_armed=False)
+                      sl_order_id=None, entry_order_id=None,
+                      balance_before_trade=None, scratch_armed=False)
     print(f"TRADE CLOSED: {status_label}")
 
 
@@ -153,54 +177,67 @@ def check_current_trade():
     if data.get("in_trade") != "True":
         return
 
-    tp_order_id = data.get("tp_order_id")
-    sl_order_id = data.get("sl_order_id")
+    # tp_order_id and sl_order_id are now the SAME value (the single
+    # bracket order's own id) - only one order to poll.
+    bracket_order_id = data.get("tp_order_id")
     side = data.get("trade_side")
     entry_time_str = data.get("entry_time")
     entry_price = float(data.get("entry_price", 0))
     trade_contracts = data.get("contracts")
     scratch_armed = data.get("scratch_armed") == "True"
+    balance_before_trade = data.get("balance_before_trade")
+    balance_before_trade = float(balance_before_trade) if balance_before_trade not in (None, "None") else None
 
-    if not tp_order_id or not sl_order_id or tp_order_id == "None" or sl_order_id == "None":
-        print("WARNING: Missing order IDs, cannot monitor this trade properly.")
+    if not bracket_order_id or bracket_order_id == "None":
+        print("WARNING: Missing bracket order id, cannot monitor this trade properly.")
         return
 
-    result = coinbase.query_orders([tp_order_id, sl_order_id])
+    result = coinbase.query_orders([bracket_order_id])
     if result.get("error"):
         print(f"Query orders error: {result['error']}")
         return
 
     orders = result.get("result", {})
-    tp_status = orders.get(tp_order_id, {}).get("status")
-    sl_status = orders.get(sl_order_id, {}).get("status")
+    bracket_status = orders.get(bracket_order_id, {}).get("status")
+    print(f"Order check | Bracket ({bracket_order_id}): {bracket_status}")
 
-    print(f"Order check | TP ({tp_order_id}): {tp_status} | SL ({sl_order_id}): {sl_status}")
+    if bracket_status == "closed":
+        exit_price = orders.get(bracket_order_id, {}).get("price", 0)
 
-    if tp_status == "closed":
-        print("TP FILLED - cancelling SL order")
-        cancel_result = coinbase.cancel_order(sl_order_id)
-        print(f"Cancel SL result: {cancel_result}")
-        exit_price = orders.get(tp_order_id, {}).get("price", 0)
-        close_trade_record("WIN", exit_price)
-        wins = int(data.get("wins", 0)) + 1
-        update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
-                          sl_order_id=None, wins=wins, scratch_armed=False)
-        print("TRADE CLOSED: WIN")
+        if balance_before_trade is None:
+            print("WARNING: no balance_before_trade saved - cannot determine WIN/LOSS. "
+                  "Recording as TIE and clearing state so the bot doesn't get stuck.")
+            close_trade_record("TIE", exit_price)
+            update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
+                              sl_order_id=None, entry_order_id=None,
+                              balance_before_trade=None, scratch_armed=False)
+            return
+
+        current_balance = get_current_balance()
+        if current_balance is None:
+            print("WARNING: could not fetch current balance to determine WIN/LOSS - will retry next poll.")
+            return
+
+        if current_balance > balance_before_trade:
+            status_label = "WIN"
+            wins = int(data.get("wins", 0)) + 1
+            close_trade_record("WIN", exit_price)
+            update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
+                              sl_order_id=None, entry_order_id=None,
+                              balance_before_trade=None, wins=wins, scratch_armed=False)
+        else:
+            status_label = "LOSS"
+            losses = int(data.get("losses", 0)) + 1
+            close_trade_record("LOSS", exit_price)
+            update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
+                              sl_order_id=None, entry_order_id=None,
+                              balance_before_trade=None, losses=losses, scratch_armed=False)
+
+        print(f"TRADE CLOSED: {status_label} | balance_before=${balance_before_trade:.2f} "
+              f"-> current=${current_balance:.2f}")
         return
 
-    if sl_status == "closed":
-        print("SL FILLED - cancelling TP order")
-        cancel_result = coinbase.cancel_order(tp_order_id)
-        print(f"Cancel TP result: {cancel_result}")
-        exit_price = orders.get(sl_order_id, {}).get("price", 0)
-        close_trade_record("LOSS", exit_price)
-        losses = int(data.get("losses", 0)) + 1
-        update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
-                          sl_order_id=None, losses=losses, scratch_armed=False)
-        print("TRADE CLOSED: LOSS")
-        return
-
-    # Neither TP nor SL filled yet - check scratch and timeout rules
+    # Bracket not filled yet - check scratch and timeout rules
     ticker_result = coinbase.get_ticker()
     if ticker_result.get("error"):
         print(f"Could not fetch current price: {ticker_result['error']}")
@@ -223,7 +260,7 @@ def check_current_trade():
             )
             if retraced_to_entry:
                 print(f"SCRATCH TRIGGERED - price retraced to entry ({entry_price})")
-                force_close_at_market(data, tp_order_id, sl_order_id, side,
+                force_close_at_market(data, bracket_order_id, side,
                                        trade_contracts, "SCRATCH")
                 return
 
@@ -237,7 +274,7 @@ def check_current_trade():
 
         if hours_open >= PROFIT_TIMEOUT_HOURS:
             print(f"TIE TRIGGERED after {hours_open:.1f}hrs - closing unconditionally")
-            force_close_at_market(data, tp_order_id, sl_order_id, side,
+            force_close_at_market(data, bracket_order_id, side,
                                    trade_contracts, "TIE")
 
 
