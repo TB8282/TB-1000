@@ -206,6 +206,30 @@ class CoinbaseClient:
         except Exception as e:
             return {"result": None, "error": str(e)}
 
+    def get_open_bracket_order(self, exclude_order_id=None):
+        """
+        FIX (Sep 17 2026): Coinbase's entry-order response has an
+        attached_order_id field, but on the first real test it came back
+        as an empty string, not the real bracket order's ID - the bracket
+        order likely isn't registered on Coinbase's side yet at the exact
+        instant the entry order responds. This works around that by
+        directly listing open orders for PRODUCT_ID and returning the
+        first one that isn't the just-filled entry order - that's the
+        live TP/SL bracket order, confirmed to exist (seen directly in
+        the Coinbase UI as a single linked "TP/SL" order).
+        """
+        try:
+            resp = self.client.list_orders(product_id=PRODUCT_ID, order_status="OPEN")
+            resp_dict = resp.to_dict()
+            orders = resp_dict.get("orders", [])
+            for o in orders:
+                oid = o.get("order_id")
+                if oid and oid != exclude_order_id:
+                    return {"result": {"order_id": oid, "raw": o}, "error": None}
+            return {"result": None, "error": f"No open orders found besides entry. Raw: {resp_dict}"}
+        except Exception as e:
+            return {"result": None, "error": str(e)}
+
     def cancel_order(self, order_id):
         try:
             resp = self.client.cancel_orders(order_ids=[order_id])
