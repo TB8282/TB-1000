@@ -289,10 +289,23 @@ def open_trade(side, webhook_close_price, candle_time):
         print("ENTRY FAILED: no order_id returned, cannot proceed")
         return
     if not bracket_order_id:
-        print("WARNING: bracket_order_id not found in response - see BRACKET DEBUG line above. "
-              "Falling back to entry_order_id for tracking; worker.py may not detect closure correctly "
-              "until this is fixed.")
-        bracket_order_id = entry_order_id
+        # FIX (Sep 17 2026): the entry response's attached_order_id came
+        # back as an empty string on the first real trade - the bracket
+        # order likely wasn't registered on Coinbase's side yet at that
+        # exact instant. Wait 1s, then look it up directly via open orders
+        # instead of trusting an empty/missing field.
+        print("bracket_order_id not in entry response - looking it up via open orders in 1s...", flush=True)
+        time.sleep(1)
+        lookup = coinbase.get_open_bracket_order(exclude_order_id=entry_order_id)
+        print(f"BRACKET LOOKUP - result: {lookup}", flush=True)
+        found_id = lookup.get("result", {}).get("order_id") if lookup.get("result") else None
+        if found_id:
+            bracket_order_id = found_id
+            print(f"BRACKET LOOKUP SUCCESS - real bracket order id: {bracket_order_id}")
+        else:
+            print(f"BRACKET LOOKUP FAILED ({lookup.get('error')}) - falling back to entry_order_id. "
+                  "worker.py may not detect closure correctly until this is fixed.")
+            bracket_order_id = entry_order_id
 
     # SAVE IMMEDIATELY - before the fill-price polling loop below.
     with state_lock:
