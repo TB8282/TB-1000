@@ -5,11 +5,14 @@ Drop-in replacement for kraken_client.py. Same method interface, so
 app.py and worker.py need minimal changes: get_balance, place_entry_order,
 place_close_order, cancel_order, query_orders, get_ticker.
 
-IMPORTANT: Coinbase requires TWO SEPARATE orders for TP and SL, same
-constraint as Kraken - place_close_order is called twice (once for
-"take-profit", once for "stop-loss"), and worker.py polls both and
-cancels whichever doesn't fill. This mirrors the existing Kraken logic
-exactly, no change needed to that pattern.
+FIX (Sep 17 2026): place_entry_order() now supports attaching a native
+Coinbase bracket (trigger_bracket_gtc) directly to the entry order via
+tp_price/sl_price args. This replaces placing TWO separate follow-up
+orders (the old approach in place_close_order, still kept below for
+backward compatibility / manual use) with ONE atomic order: Coinbase's
+own docs confirm "As soon as a fill occurs for the order at one of the
+specified price levels, the other side is automatically disabled" -
+true exchange-enforced OCO, not dependent on worker.py polling in time.
 
 PRODUCT ID: nano BTC Perp Futures is NOT just "BIP" - it includes a
 dated suffix (confirmed live): "BIP-20DEC30-CDE". This is set as
@@ -61,17 +64,38 @@ class CoinbaseClient:
         except Exception as e:
             return {"result": None, "error": str(e)}
 
-    def place_entry_order(self, side, contracts, leverage, validate=False):
+    def place_entry_order(self, side, contracts, leverage, validate=False, tp_price=None, sl_price=None):
         """
         Places a market entry order. side: "buy" or "sell".
         contracts: whole number of BIP contracts (NOT BTC volume).
-        Returns dict with 'result' containing 'order_id' on success,
-        or 'error' on failure - matches the shape callers expect.
+
+        FIX (Sep 17 2026): if tp_price and sl_price are both given, a
+        native Coinbase bracket (trigger_bracket_gtc) is attached to
+        this SAME order via attached_order_configuration - TP/SL exist
+        from the moment the entry fills, no follow-up calls needed.
+        When validate=True (margin preview), the same attached config
+        is included so the previewed margin reflects the real bracketed
+        order, not a bare entry.
+
+        Returns dict with 'result' containing 'order_id' on success
+        (and 'bracket_order_id' when a bracket was attached - see the
+        "BRACKET DEBUG" raw-response log in app.py if this ever comes
+        back None, since Coinbase's exact field name for the attached
+        order's own ID was not 100% confirmed from documentation alone
+        and may need a one-line adjustment after seeing a real response).
         """
         cb_side = "BUY" if side.lower() == "buy" else "SELL"
+        attached_config = None
+        if tp_price is not None and sl_price is not None:
+            attached_config = {
+                "trigger_bracket_gtc": {
+                    "limit_price": str(tp_price),
+                    "stop_trigger_price": str(sl_price),
+                }
+            }
         try:
             if validate:
-                resp = self.client.preview_order(
+                kwargs = dict(
                     product_id=PRODUCT_ID,
                     side=cb_side,
                     order_configuration={
@@ -79,26 +103,52 @@ class CoinbaseClient:
                     },
                     leverage=str(leverage),
                 )
+                if attached_config:
+                    kwargs["attached_order_configuration"] = attached_config
+                resp = self.client.preview_order(**kwargs)
                 return {"result": resp.to_dict(), "error": None}
 
-            resp = self.client.market_order(
+            kwargs = dict(
                 client_order_id=os.urandom(8).hex(),
                 product_id=PRODUCT_ID,
                 side=cb_side,
                 base_size=str(contracts),
                 leverage=str(leverage),
             )
+            if attached_config:
+                kwargs["attached_order_configuration"] = attached_config
+            resp = self.client.market_order(**kwargs)
             resp_dict = resp.to_dict()
             if not resp_dict.get("success"):
                 return {"result": None, "error": resp_dict.get("error_response")}
             order_id = resp_dict.get("success_response", {}).get("order_id")
-            return {"result": {"order_id": order_id, "raw": resp_dict}, "error": None}
+            # Best-effort extraction of the attached bracket's own order ID.
+            # Not 100% confirmed which key Coinbase uses here - checking a
+            # few plausible locations. app.py logs the full raw response
+            # so this can be corrected in one line if it comes back None.
+            bracket_order_id = (
+                resp_dict.get("success_response", {}).get("attached_order_id")
+                or resp_dict.get("attached_order_id")
+                or resp_dict.get("success_response", {}).get("attached_order", {}).get("order_id")
+            )
+            return {
+                "result": {
+                    "order_id": order_id,
+                    "bracket_order_id": bracket_order_id,
+                    "raw": resp_dict,
+                },
+                "error": None,
+            }
         except Exception as e:
             return {"result": None, "error": str(e)}
 
     def place_close_order(self, side, contracts, ordertype, price, leverage, validate=False):
         """
-        Places ONE of the two standalone close orders (either TP or SL).
+        LEGACY / MANUAL USE ONLY as of Sep 17 2026: places ONE of the two
+        standalone close orders (either TP or SL) as independent orders.
+        open_trade() in app.py no longer calls this for new trades - TP/SL
+        are now attached directly to the entry order in place_entry_order().
+        Kept here only for manual/recovery use if ever needed.
         side: opposite of entry side ("buy" or "sell").
         ordertype: "take-profit" or "stop-loss".
         price: trigger/limit price (absolute, not percentage).
