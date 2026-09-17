@@ -38,6 +38,7 @@ state = {
     "sl_order_id": None,
     "entry_time": None,
     "contracts": None,
+    "balance_before_trade": None,
     "green_anchor": None,
     "red_anchor": None,
     "candle_count": 0,
@@ -132,6 +133,8 @@ def load_state():
                 state["entry_time"] = None if db_values["entry_time"] == "None" else db_values["entry_time"]
             if "contracts" in db_values:
                 state["contracts"] = None if db_values["contracts"] == "None" else db_values["contracts"]
+            if "balance_before_trade" in db_values:
+                state["balance_before_trade"] = safe_float(db_values["balance_before_trade"])
             if "wins" in db_values:
                 state["wins"] = int(db_values["wins"])
             if "losses" in db_values:
@@ -149,7 +152,7 @@ def save_state():
         cur = conn.cursor()
         for key in ["in_trade", "trade_side", "entry_price", "entry_order_id", "tp_price",
                     "sl_price", "tp_order_id", "sl_order_id", "entry_time",
-                    "contracts", "wins", "losses"]:
+                    "contracts", "balance_before_trade", "wins", "losses"]:
             cur.execute("""
                 INSERT INTO coinbase_bot_state (key, value) VALUES (%s, %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
@@ -179,47 +182,45 @@ def save_trade(t):
         print(f"DB save trade error: {e}")
 
 
-def calculate_contracts(entry_side):
+def calculate_contracts(entry_side, tp_price=None, sl_price=None):
     """
     Calculates position size in WHOLE CONTRACTS using the REAL live margin
     requirement from Coinbase's own preview_order endpoint - NOT a hardcoded
     leverage assumption.
 
-    TIMING INSTRUMENTATION ADDED (Sep 15 2026): every Coinbase API call in
-    this function is now wrapped with elapsed-time logging, to find which
-    specific call is stalling and causing the ongoing SystemExit/worker
-    timeout crashes even after raising Gunicorn's --timeout to 120s.
+    FIX (Sep 17 2026): tp_price/sl_price are now passed into the margin
+    PREVIEW too (not just the real order), since attaching a bracket to
+    the entry order can affect the real margin Coinbase requires - this
+    keeps the preview accurate to what will actually be submitted.
     """
     t0 = time.time()
     bal_result = coinbase.get_balance()
     print(f"TIMING: get_balance() took {time.time() - t0:.2f}s", flush=True)
     if bal_result.get("error"):
         print(f"BALANCE CHECK FAILED: {bal_result['error']}")
-        return None
+        return None, None
     balance_data = bal_result.get("result", {}).get("balance_summary", {})
-    # FIX (Sep 15 2026): cbi_usd_balance only reflects the SPOT account and
-    # misses cash already sitting in the Derivatives/CFM account (confirmed
-    # via Coinbase's own API docs and the order form's "Available (USD +
-    # USDC)" figure). futures_buying_power is Coinbase's own documented
-    # "amount of cash balance available to trade CFM futures" - the correct
-    # combined number, matching what the order form itself shows.
+    # futures_buying_power is Coinbase's own documented "amount of cash
+    # balance available to trade CFM futures" - the correct combined
+    # (spot + derivatives) number, matching what the order form itself shows.
     usd_balance = float(balance_data.get("futures_buying_power", {}).get("value", 0))
     if usd_balance <= 0:
         print(f"WARNING: futures_buying_power is {usd_balance} - nothing to trade with.")
-        return None
+        return None, None
 
     t1 = time.time()
-    preview_result = coinbase.place_entry_order(entry_side, 1, LEVERAGE, validate=True)
+    preview_result = coinbase.place_entry_order(entry_side, 1, LEVERAGE, validate=True,
+                                                  tp_price=tp_price, sl_price=sl_price)
     print(f"TIMING: preview_order() (margin check) took {time.time() - t1:.2f}s", flush=True)
     if preview_result.get("error"):
         print(f"MARGIN PREVIEW FAILED: {preview_result['error']}")
-        return None
+        return None, None
 
     preview_data = preview_result.get("result", {})
     margin_per_contract = safe_float(preview_data.get("order_margin_total"))
     if not margin_per_contract or margin_per_contract <= 0:
         print(f"PREVIEW RETURNED NO USABLE MARGIN VALUE: {preview_data}")
-        return None
+        return None, None
 
     available_for_trading = usd_balance * BALANCE_SAFETY_PCT
     contracts = int(available_for_trading // margin_per_contract)
@@ -227,67 +228,88 @@ def calculate_contracts(entry_side):
           f"margin_per_contract=${margin_per_contract:.2f} (LIVE preview) | "
           f"available_for_trading=${available_for_trading:.2f} | contracts={contracts}")
     print(f"TIMING: calculate_contracts() TOTAL took {time.time() - t0:.2f}s", flush=True)
-    return contracts if contracts > 0 else None
+    return (contracts, usd_balance) if contracts > 0 else (None, usd_balance)
 
 
 def open_trade(side, webhook_close_price, candle_time):
     """
-    Places the real entry order on Coinbase, then queries for the ACTUAL
-    fill price. Same HA-distortion protection as the Kraken version -
-    signal comes from the chart, price math comes from the exchange.
+    Places the real entry order on Coinbase WITH a native TP/SL bracket
+    attached (trigger_bracket_gtc) - one atomic order, not two follow-up
+    orders. Coinbase's own docs confirm the untriggered side auto-cancels
+    the instant the other fills - true exchange-enforced OCO.
 
-    FIX (Sep 14 2026): every order ID is saved to the DB immediately
-    after Coinbase returns it - BEFORE any further slow/blocking code
-    runs (fill-price polling, the next order call, etc).
+    FIX (Sep 17 2026): TP/SL are now calculated from the webhook's close
+    price BEFORE the entry order is placed (not from the confirmed fill
+    price afterward), because the bracket must be submitted at the same
+    moment as the entry order itself. This trades a small amount of price
+    precision (signal price vs exact fill price) for atomic, guaranteed
+    TP/SL protection with no window where the position is unprotected.
 
-    TIMING INSTRUMENTATION ADDED (Sep 15 2026): wraps every remaining
-    Coinbase API call (entry order, fill-price poll, TP order, SL order)
-    with elapsed-time logging, plus a running total from function start,
-    to find where the SystemExit/worker-timeout crash is actually
-    happening - it is still occurring even with Gunicorn's timeout
-    raised to 120s, so something is stalling longer than expected.
+    Also records balance_before_trade so worker.py can determine WIN/LOSS
+    by comparing balance after the trade closes to balance before it
+    opened - simpler and more certain than trying to determine which
+    specific leg (TP or SL) of a merged bracket order triggered.
     """
     func_start = time.time()
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
 
-    contracts = calculate_contracts(entry_side)
+    # TP/SL calculated up front from the webhook close price - required so
+    # they can be attached to the entry order itself, before any fill is
+    # confirmed.
+    if side == "LONG":
+        tp = round(webhook_close_price * (1 + TP_PCT) / 5) * 5
+        sl = round(webhook_close_price * (1 - SL_PCT) / 5) * 5
+    else:
+        tp = round(webhook_close_price * (1 - TP_PCT) / 5) * 5
+        sl = round(webhook_close_price * (1 + SL_PCT) / 5) * 5
+
+    contracts, usd_balance = calculate_contracts(entry_side, tp_price=tp, sl_price=sl)
     print(f"TIMING: [elapsed {time.time() - func_start:.2f}s] after calculate_contracts()", flush=True)
     if not contracts:
         print("TRADE ABORTED: could not calculate contract size from live balance/margin.")
         return
 
     t_entry = time.time()
-    entry_result = coinbase.place_entry_order(entry_side, contracts, LEVERAGE)
-    print(f"TIMING: place_entry_order() took {time.time() - t_entry:.2f}s "
+    entry_result = coinbase.place_entry_order(entry_side, contracts, LEVERAGE, tp_price=tp, sl_price=sl)
+    print(f"TIMING: place_entry_order() (with attached bracket) took {time.time() - t_entry:.2f}s "
           f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
     if entry_result.get("error"):
         print(f"ENTRY ORDER FAILED: {entry_result['error']}")
         return
-    print(f"Entry order placed: {entry_result}")
+
+    # BRACKET DEBUG: full raw response, so if bracket_order_id below ever
+    # comes back None, this shows exactly where Coinbase actually put the
+    # attached order's ID, for a one-line fix in coinbase_client.py.
+    print(f"BRACKET DEBUG - full raw entry response: {entry_result}", flush=True)
 
     entry_order_id = entry_result.get("result", {}).get("order_id")
+    bracket_order_id = entry_result.get("result", {}).get("bracket_order_id")
     if not entry_order_id:
         print("ENTRY FAILED: no order_id returned, cannot proceed")
         return
+    if not bracket_order_id:
+        print("WARNING: bracket_order_id not found in response - see BRACKET DEBUG line above. "
+              "Falling back to entry_order_id for tracking; worker.py may not detect closure correctly "
+              "until this is fixed.")
+        bracket_order_id = entry_order_id
 
     # SAVE IMMEDIATELY - before the fill-price polling loop below.
-    t_save1 = time.time()
     with state_lock:
         state["in_trade"] = True
         state["trade_side"] = side
         state["entry_price"] = webhook_close_price
         state["entry_order_id"] = entry_order_id
-        state["tp_price"] = None
-        state["sl_price"] = None
-        state["tp_order_id"] = None
-        state["sl_order_id"] = None
+        state["tp_price"] = tp
+        state["sl_price"] = sl
+        state["tp_order_id"] = bracket_order_id
+        state["sl_order_id"] = bracket_order_id
         state["entry_time"] = candle_time
         state["contracts"] = contracts
+        state["balance_before_trade"] = usd_balance
     save_state()
-    print(f"TIMING: entry save_state() took {time.time() - t_save1:.2f}s "
-          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
-    print(f"Entry order_id saved to DB immediately: {entry_order_id}")
+    print(f"Entry + bracket saved to DB immediately: entry={entry_order_id} "
+          f"bracket={bracket_order_id} balance_before_trade=${usd_balance:.2f}")
 
     entry_price = None
     t_poll = time.time()
@@ -303,7 +325,7 @@ def open_trade(side, webhook_close_price, candle_time):
 
     if not entry_price:
         print("WARNING: Could not confirm real fill price after 5 attempts. "
-              f"Falling back to webhook close price ({webhook_close_price}).")
+              f"Falling back to webhook close price ({webhook_close_price}) for the trade record.")
         entry_price = webhook_close_price
     else:
         print(f"Confirmed REAL fill price from Coinbase: {entry_price} "
@@ -312,50 +334,14 @@ def open_trade(side, webhook_close_price, candle_time):
             state["entry_price"] = entry_price
         save_state()
 
-    if side == "LONG":
-        tp = round(entry_price * (1 + TP_PCT) / 5) * 5
-        sl = round(entry_price * (1 - SL_PCT) / 5) * 5
-    else:
-        tp = round(entry_price * (1 - TP_PCT) / 5) * 5
-        sl = round(entry_price * (1 + SL_PCT) / 5) * 5
-
-    t_tp = time.time()
-    tp_result = coinbase.place_close_order(exit_side, contracts, "take-profit", tp, LEVERAGE)
-    print(f"TIMING: place_close_order(TP) took {time.time() - t_tp:.2f}s "
-          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
-    tp_order_id = None
-    if tp_result.get("error"):
-        print(f"TP ORDER FAILED: {tp_result['error']}")
-    else:
-        tp_order_id = tp_result.get("result", {}).get("order_id")
-        with state_lock:
-            state["tp_price"] = tp
-            state["tp_order_id"] = tp_order_id
-        save_state()
-        print(f"TP order_id saved to DB immediately: {tp_order_id}")
-
-    t_sl = time.time()
-    sl_result = coinbase.place_close_order(exit_side, contracts, "stop-loss", sl, LEVERAGE)
-    print(f"TIMING: place_close_order(SL) took {time.time() - t_sl:.2f}s "
-          f"| [elapsed {time.time() - func_start:.2f}s total]", flush=True)
-    sl_order_id = None
-    if sl_result.get("error"):
-        print(f"SL ORDER FAILED: {sl_result['error']}")
-    else:
-        sl_order_id = sl_result.get("result", {}).get("order_id")
-        with state_lock:
-            state["sl_price"] = sl
-            state["sl_order_id"] = sl_order_id
-        save_state()
-        print(f"SL order_id saved to DB immediately: {sl_order_id}")
-
     save_trade({
         "time": candle_time, "side": side, "entry_price": entry_price,
-        "tp_price": tp, "sl_price": sl, "tp_order_id": tp_order_id, "sl_order_id": sl_order_id,
+        "tp_price": tp, "sl_price": sl, "tp_order_id": bracket_order_id, "sl_order_id": bracket_order_id,
     })
-    print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} ({tp_order_id}) | SL: {sl} ({sl_order_id})")
+    print(f"TRADE OPENED: {side} | Entry: {entry_price} | TP: {tp} | SL: {sl} | Bracket: {bracket_order_id}")
     print(f"TIMING: open_trade() TOTAL took {time.time() - func_start:.2f}s", flush=True)
-    print("NOTE: worker.py must poll tp_order_id/sl_order_id and cancel whichever doesn't fill.")
+    print("NOTE: worker.py now determines WIN/LOSS by comparing balance before/after, "
+          "not by which leg of the bracket filled.")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -372,18 +358,10 @@ def webhook():
 
         print(f"Dot: {dot} | Value: {round(value, 2)} | Close: {close_price}")
 
-        # FIX (Sep 16 2026): open_trade() must NEVER be called while
-        # state_lock is held. state_lock is a plain threading.Lock (not
-        # reentrant) - open_trade() itself acquires state_lock internally
-        # to save entry/TP/SL state. Calling open_trade() from inside this
-        # same "with state_lock:" block caused every single trade to hang
-        # forever at open_trade()'s "with state_lock:" line, waiting on a
-        # lock this same thread already held. Gunicorn's worker-timeout
-        # (30s originally, 120s after that change) was the only thing that
-        # ever ended it - explaining every SystemExit/WORKER TIMEOUT crash
-        # traced back to that exact line across every incident this week.
-        # Fix: decide inside the lock (cheap, in-memory), release the lock,
-        # THEN call open_trade() if a valid signal fired.
+        # open_trade() must NEVER be called while state_lock is held - it
+        # acquires state_lock itself internally, and Python's threading.Lock
+        # is not reentrant. Decide inside the lock (cheap, in-memory),
+        # release the lock, THEN call open_trade() if a valid signal fired.
         trade_side_to_open = None
 
         with state_lock:
@@ -580,6 +558,7 @@ def close_manual():
         state["sl_order_id"] = None
         state["entry_time"] = None
         state["contracts"] = None
+        state["balance_before_trade"] = None
 
     save_state()
     return jsonify({"status": "closed", "state": {k: v for k, v in state.items() if k not in ("green_anchor", "red_anchor")}})
