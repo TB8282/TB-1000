@@ -23,6 +23,15 @@ precise about the exact fill price recorded (uses the bracket order's
 own reported price for the trade record, balance comparison only
 decides WIN/LOSS).
 
+FIX (Sep 18 2026): Coinbase reports the bracket ORDER's own status as
+CANCELLED once one leg fills (the bracket wrapper itself gets
+cancelled, not marked FILLED) - not "closed" as expected. This left
+trades stuck in_trade=True forever, since the old code only acted on
+status=="closed". Now CANCELLED is treated the same as closed: a
+cancelled bracket means one side filled (real trades don't get
+cancelled with no fill mid-flight), so WIN/LOSS is determined the
+same way as before (balance before vs after).
+
 SCRATCH RULE (unchanged):
 Once a trade's unrealized profit reaches SCRATCH_ARM_PCT (0.5%), the
 trade is "armed." If price then retraces back to the entry price while
@@ -201,7 +210,11 @@ def check_current_trade():
     bracket_status = orders.get(bracket_order_id, {}).get("status")
     print(f"Order check | Bracket ({bracket_order_id}): {bracket_status}")
 
-    if bracket_status == "closed":
+    # FIX (Sep 18 2026): Coinbase reports the bracket's own status as
+    # CANCELLED once one leg fills (not FILLED/closed) - a real trade's
+    # bracket does not get cancelled with no fill mid-flight, so treat
+    # CANCELLED the same as closed/filled here.
+    if bracket_status in ("closed", "CANCELLED"):
         exit_price = orders.get(bracket_order_id, {}).get("price", 0)
 
         if balance_before_trade is None:
