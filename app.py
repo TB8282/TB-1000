@@ -98,18 +98,34 @@ def load_state():
     app.py's in-memory state dict resets to defaults (in_trade=False)
     on every redeploy/restart, even if a real trade is still open on
     Coinbase and being tracked by worker.py via the same DB table.
+
+    FIX (Sep 18 2026): wins/losses are now recalculated directly from
+    the coinbase_trades table (source of truth - one row per real
+    trade) instead of trusting the separately-stored counter in
+    coinbase_bot_state, which was going stale/out of sync with the
+    actual trade history (dashboard showed 1W/0L while the trade
+    table had 2 LOSS rows).
     """
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute("SELECT key, value FROM coinbase_bot_state")
         rows = cur.fetchall()
+
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='WIN'")
+        real_wins = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='LOSS'")
+        real_losses = cur.fetchone()[0]
+
         cur.close()
         conn.close()
 
         db_values = {k: v for k, v in rows}
         if not db_values:
             print("No saved state found in DB - starting fresh.")
+            with state_lock:
+                state["wins"] = real_wins
+                state["losses"] = real_losses
             return
 
         with state_lock:
@@ -135,13 +151,13 @@ def load_state():
                 state["contracts"] = None if db_values["contracts"] == "None" else db_values["contracts"]
             if "balance_before_trade" in db_values:
                 state["balance_before_trade"] = safe_float(db_values["balance_before_trade"])
-            if "wins" in db_values:
-                state["wins"] = int(db_values["wins"])
-            if "losses" in db_values:
-                state["losses"] = int(db_values["losses"])
+
+            state["wins"] = real_wins
+            state["losses"] = real_losses
 
         print(f"State loaded from DB: in_trade={state['in_trade']} | "
-              f"trade_side={state['trade_side']} | wins={state['wins']} | losses={state['losses']}")
+              f"trade_side={state['trade_side']} | wins={state['wins']} (from trade table) | "
+              f"losses={state['losses']} (from trade table)")
     except Exception as e:
         print(f"State load error: {e}")
 
