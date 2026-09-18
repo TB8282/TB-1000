@@ -238,12 +238,15 @@ def open_trade(side, webhook_close_price, candle_time):
     orders. Coinbase's own docs confirm the untriggered side auto-cancels
     the instant the other fills - true exchange-enforced OCO.
 
-    FIX (Sep 17 2026): TP/SL are now calculated from the webhook's close
-    price BEFORE the entry order is placed (not from the confirmed fill
-    price afterward), because the bracket must be submitted at the same
-    moment as the entry order itself. This trades a small amount of price
-    precision (signal price vs exact fill price) for atomic, guaranteed
-    TP/SL protection with no window where the position is unprotected.
+    FIX (Sep 18 2026): TP/SL are now calculated from Coinbase's own live
+    real-time price (via get_ticker()), NOT the webhook's close value.
+    The webhook's close is the Heikin-Ashi candle price (used correctly
+    for signal/trigger logic, but not representative of real market
+    price), and by the time this function runs it can also be stale by
+    up to ~120 seconds if webhook delivery/processing was slow. Pulling
+    a fresh live price right before submitting removes both problems.
+    Falls back to webhook_close_price only if the live price fetch
+    itself errors out, so a trade is never aborted over this.
 
     Also records balance_before_trade so worker.py can determine WIN/LOSS
     by comparing balance after the trade closes to balance before it
@@ -254,15 +257,26 @@ def open_trade(side, webhook_close_price, candle_time):
     entry_side = "buy" if side == "LONG" else "sell"
     exit_side = "sell" if side == "LONG" else "buy"
 
-    # TP/SL calculated up front from the webhook close price - required so
-    # they can be attached to the entry order itself, before any fill is
-    # confirmed.
-    if side == "LONG":
-        tp = round(webhook_close_price * (1 + TP_PCT) / 5) * 5
-        sl = round(webhook_close_price * (1 - SL_PCT) / 5) * 5
+    # TP/SL calculated up front - required so they can be attached to the
+    # entry order itself, before any fill is confirmed.
+    # FIX (real price, not HA/stale): pull Coinbase's real live price right
+    # now instead of using the webhook's close value (HA candle price,
+    # and can also be stale by the time this runs). Falls back to
+    # webhook_close_price only if the live price fetch fails.
+    ticker_result = coinbase.get_ticker()
+    if not ticker_result.get("error"):
+        base_price = ticker_result["result"]["price"]
+        print(f"Using live real price for TP/SL calc: {base_price} (webhook close was: {webhook_close_price})", flush=True)
     else:
-        tp = round(webhook_close_price * (1 - TP_PCT) / 5) * 5
-        sl = round(webhook_close_price * (1 + SL_PCT) / 5) * 5
+        base_price = webhook_close_price
+        print(f"WARNING: live price fetch failed ({ticker_result['error']}) - falling back to webhook close price", flush=True)
+
+    if side == "LONG":
+        tp = round(base_price * (1 + TP_PCT) / 5) * 5
+        sl = round(base_price * (1 - SL_PCT) / 5) * 5
+    else:
+        tp = round(base_price * (1 - TP_PCT) / 5) * 5
+        sl = round(base_price * (1 + SL_PCT) / 5) * 5
 
     contracts, usd_balance = calculate_contracts(entry_side, tp_price=tp, sl_price=sl)
     print(f"TIMING: [elapsed {time.time() - func_start:.2f}s] after calculate_contracts()", flush=True)
@@ -420,7 +434,11 @@ def webhook():
                     print(f"NEW RED anchor: {round(value, 2)}")
 
         # state_lock is now RELEASED. Safe for open_trade() to acquire it.
-                if trade_side_to_open:
+        # FIX (webhook timeout): run open_trade() in a background thread so
+        # Flask can respond to TradingView immediately instead of waiting
+        # for the full trade-opening process (balance check, order, fill
+        # poll) to finish. Nothing inside open_trade() itself changes.
+        if trade_side_to_open:
             threading.Thread(target=open_trade, args=(trade_side_to_open, close_price, now)).start()
 
         return jsonify({"status": "ok"}), 200
