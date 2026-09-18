@@ -561,6 +561,27 @@ def ping():
     return "pong", 200
 
 
+@app.route("/admin_delete_losses", methods=["GET"])
+def admin_delete_losses():
+    """
+    ONE-TIME recovery tool: deletes all LOSS rows from coinbase_trades.
+    Used to clear stale/pre-fix loss records so wins/losses (recalculated
+    from this table by load_state()) reflect only real post-fix trades.
+    Visit as a URL once, then this can be removed.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM coinbase_trades WHERE status = 'LOSS'")
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"status": "ok", "deleted_rows": deleted})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def close_trade_record(status, exit_price):
     conn = get_db()
     cur = conn.cursor()
