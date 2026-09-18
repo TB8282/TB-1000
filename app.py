@@ -420,8 +420,8 @@ def webhook():
                     print(f"NEW RED anchor: {round(value, 2)}")
 
         # state_lock is now RELEASED. Safe for open_trade() to acquire it.
-        if trade_side_to_open:
-            open_trade(trade_side_to_open, close_price, now)
+                if trade_side_to_open:
+            threading.Thread(target=open_trade, args=(trade_side_to_open, close_price, now)).start()
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
