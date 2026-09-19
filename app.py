@@ -554,14 +554,23 @@ def webhook():
                     elif state["in_trade"]:
                         print("Already in trade - ignored")
                     elif not state["green_declining"]:
-                        # RULE 5: don't trust a SHORT until a green dot has
-                        # printed lower than the previous green dot -
-                        # confirms the uptrend has actually broken. Anchor
-                        # is kept as-is (not updated to this new value) so
-                        # a later dot can still complete a valid trigger
-                        # once the reversal is confirmed.
+                        # RULE 5 (confirmation) + RULE 9 (consecutive dot
+                        # invalidation): don't trust a SHORT until a green
+                        # dot has printed lower than the previous green dot
+                        # - confirms the uptrend has actually broken. Unlike
+                        # the old behavior, this dot does NOT just get
+                        # skipped while the anchor stays active - it
+                        # INVALIDATES the whole setup, since red dots after
+                        # an anchor must be consecutive (each one lower
+                        # than the previous). This dot is lower than the
+                        # anchor but can't fire (blocked) and can't itself
+                        # be a valid anchor either (below ANCHOR_LEVEL), so
+                        # nothing is left to hold onto - reset to None and
+                        # require a brand new >=35 red dot to start over.
                         print(f"SHORT trigger valid but uptrend not confirmed broken "
-                              f"(green still climbing) - anchor kept, trade skipped")
+                              f"(green still climbing) - ANCHOR INVALIDATED (Rule 9), "
+                              f"trade skipped, must re-anchor")
+                        state["red_anchor"] = None
                     else:
                         print(f"VALID SHORT! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
                         # Same as GREEN above - reset to None instead of
