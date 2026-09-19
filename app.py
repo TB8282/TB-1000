@@ -46,6 +46,8 @@ state = {
     "losses": 0,
     "scratches": 0,
     "ties": 0,
+    "last_green_value": None,
+    "green_declining": False,
 }
 state_lock = threading.Lock()
 
@@ -502,23 +504,38 @@ def webhook():
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
 
             if dot == "green":
+                # RULE 5 tracking: update the green-dot-declining flag on
+                # EVERY green dot, regardless of anchor state. This tracks
+                # whether the most recent green dot is lower than the one
+                # before it - used by the SHORT trigger below to confirm
+                # an uptrend has actually broken before trusting a SHORT.
+                if state["last_green_value"] is not None:
+                    state["green_declining"] = value < state["last_green_value"]
+                state["last_green_value"] = value
+
                 anchor = state["green_anchor"]
                 if anchor is None:
                     if value <= -ANCHOR_LEVEL:
                         state["green_anchor"] = {"value": value}
                         print(f"GREEN anchor stored: {round(value, 2)}")
                 elif value > anchor["value"]:
-                    if value > TRIGGER_MAX_GREEN:
-                        print(f"GREEN trigger too high ({round(value,2)}) - anchor kept")
+                    # RULE 6: the trigger must stay on the SAME SIDE OF ZERO
+                    # as the anchor itself (anchor is always negative, since
+                    # it required value <= -ANCHOR_LEVEL to be set). A green
+                    # dot that has crossed to positive (>= 0) is ignored
+                    # entirely as a trigger candidate - not treated as
+                    # invalidating the anchor, just not a valid trigger this
+                    # time. Replaces the old TRIGGER_MAX_GREEN (+15) cap.
+                    if value >= 0:
+                        print(f"GREEN trigger crossed zero ({round(value,2)}) - ignored, anchor kept")
                     elif state["in_trade"]:
                         print("Already in trade - ignored")
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        # FIX (Sep 19 2026): anchor resets to None after a
-                        # valid trigger, instead of carrying the trigger's
-                        # value forward. An anchor must sit outside the
-                        # -35/+35 band; the trigger value itself is always
-                        # inside that band, so it is never a valid anchor.
+                        # Anchor resets to None after a valid trigger, instead
+                        # of carrying the trigger's value forward - an anchor
+                        # must sit outside the -35/+35 band, and the trigger
+                        # value itself is always inside that band.
                         state["green_anchor"] = None
                         trade_side_to_open = "LONG"
                 elif value <= -ANCHOR_LEVEL:
@@ -536,10 +553,19 @@ def webhook():
                         print(f"RED trigger too low ({round(value,2)}) - anchor kept")
                     elif state["in_trade"]:
                         print("Already in trade - ignored")
+                    elif not state["green_declining"]:
+                        # RULE 5: don't trust a SHORT until a green dot has
+                        # printed lower than the previous green dot -
+                        # confirms the uptrend has actually broken. Anchor
+                        # is kept as-is (not updated to this new value) so
+                        # a later dot can still complete a valid trigger
+                        # once the reversal is confirmed.
+                        print(f"SHORT trigger valid but uptrend not confirmed broken "
+                              f"(green still climbing) - anchor kept, trade skipped")
                     else:
                         print(f"VALID SHORT! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        # FIX (Sep 19 2026): same as GREEN above - reset to
-                        # None instead of carrying the trigger value forward.
+                        # Same as GREEN above - reset to None instead of
+                        # carrying the trigger value forward.
                         state["red_anchor"] = None
                         trade_side_to_open = "SHORT"
                 elif value >= ANCHOR_LEVEL:
