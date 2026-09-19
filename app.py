@@ -424,7 +424,12 @@ def webhook():
                         print("Already in trade - ignored")
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        state["green_anchor"] = {"value": value}
+                        # FIX (Sep 19 2026): anchor resets to None after a
+                        # valid trigger, instead of carrying the trigger's
+                        # value forward. An anchor must sit outside the
+                        # -35/+35 band; the trigger value itself is always
+                        # inside that band, so it is never a valid anchor.
+                        state["green_anchor"] = None
                         trade_side_to_open = "LONG"
                 elif value <= -ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value}
@@ -443,7 +448,9 @@ def webhook():
                         print("Already in trade - ignored")
                     else:
                         print(f"VALID SHORT! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        state["red_anchor"] = {"value": value}
+                        # FIX (Sep 19 2026): same as GREEN above - reset to
+                        # None instead of carrying the trigger value forward.
+                        state["red_anchor"] = None
                         trade_side_to_open = "SHORT"
                 elif value >= ANCHOR_LEVEL:
                     state["red_anchor"] = {"value": value}
@@ -554,6 +561,26 @@ def dashboard():
         "</body></html>"
     )
     return html
+
+
+@app.route("/set_anchor", methods=["GET"])
+def set_anchor():
+    """
+    Manually sets green_anchor or red_anchor (recovery tool - anchors
+    live in memory only and reset to None on every redeploy).
+    Visit as a URL, e.g.:
+    /set_anchor?color=red&value=84.44
+    color must be 'green' or 'red'.
+    """
+    color = request.args.get("color", "").lower()
+    value = safe_float(request.args.get("value"))
+    if color not in ("green", "red") or value is None:
+        return jsonify({"error": "required params: color (green/red), value"}), 400
+
+    with state_lock:
+        state[f"{color}_anchor"] = {"value": value}
+
+    return jsonify({"status": "ok", "color": color, "value": value})
 
 
 @app.route("/ping", methods=["GET"])
