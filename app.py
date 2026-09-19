@@ -44,6 +44,8 @@ state = {
     "candle_count": 0,
     "wins": 0,
     "losses": 0,
+    "scratches": 0,
+    "ties": 0,
 }
 state_lock = threading.Lock()
 
@@ -116,6 +118,10 @@ def load_state():
         real_wins = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='LOSS'")
         real_losses = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='SCRATCH'")
+        real_scratches = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='TIE'")
+        real_ties = cur.fetchone()[0]
 
         cur.close()
         conn.close()
@@ -126,6 +132,8 @@ def load_state():
             with state_lock:
                 state["wins"] = real_wins
                 state["losses"] = real_losses
+                state["scratches"] = real_scratches
+                state["ties"] = real_ties
             return
 
         with state_lock:
@@ -154,6 +162,8 @@ def load_state():
 
             state["wins"] = real_wins
             state["losses"] = real_losses
+            state["scratches"] = real_scratches
+            state["ties"] = real_ties
 
         print(f"State loaded from DB: in_trade={state['in_trade']} | "
               f"trade_side={state['trade_side']} | wins={state['wins']} (from trade table) | "
@@ -351,6 +361,23 @@ def open_trade(side, webhook_close_price, candle_time):
         state["contracts"] = contracts
         state["balance_before_trade"] = usd_balance
     save_state()
+    # FIX (Sep 19 2026): defensively reset scratch_armed at the start of
+    # every new trade, regardless of how the previous trade closed. This
+    # is belt-and-suspenders on top of the close_manual/resync fixes -
+    # a new trade should NEVER inherit an armed scratch flag from
+    # whatever came before it.
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO coinbase_bot_state (key, value) VALUES ('scratch_armed', 'False')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to reset scratch_armed in open_trade: {e}")
     print(f"Entry + bracket saved to DB immediately: entry={entry_order_id} "
           f"bracket={bracket_order_id} balance_before_trade=${usd_balance:.2f}")
 
@@ -387,9 +414,72 @@ def open_trade(side, webhook_close_price, candle_time):
           "not by which leg of the bracket filled.")
 
 
+def sync_state_from_db():
+    """
+    FIX (Sep 19 2026): app.py's in-memory `state` dict only ever loaded
+    from the DB once, at startup (load_state()). worker.py runs as a
+    SEPARATE process and updates the DB directly when it closes a trade
+    (WIN/LOSS/TIE/SCRATCH) - but app.py's own in-memory copy never heard
+    about it. Confirmed real symptom: a trade scratch-closed correctly in
+    the DB (in_trade=False), but the dashboard and webhook() kept reading
+    in-memory state showing in_trade=true for that same dead trade -
+    risking new valid signals being wrongly ignored as "already in trade."
+    Called at the top of both webhook() and dashboard() so the tracker
+    always reflects the real DB state before anything reads it.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM coinbase_bot_state")
+        rows = cur.fetchall()
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='WIN'")
+        real_wins = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='LOSS'")
+        real_losses = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='SCRATCH'")
+        real_scratches = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM coinbase_trades WHERE status='TIE'")
+        real_ties = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        db_values = {k: v for k, v in rows}
+        if not db_values:
+            return
+        with state_lock:
+            state["wins"] = real_wins
+            state["losses"] = real_losses
+            state["scratches"] = real_scratches
+            state["ties"] = real_ties
+            if "in_trade" in db_values:
+                state["in_trade"] = db_values["in_trade"] == "True"
+            if "trade_side" in db_values:
+                state["trade_side"] = None if db_values["trade_side"] == "None" else db_values["trade_side"]
+            if "entry_price" in db_values:
+                state["entry_price"] = safe_float(db_values["entry_price"])
+            if "entry_order_id" in db_values:
+                state["entry_order_id"] = None if db_values["entry_order_id"] == "None" else db_values["entry_order_id"]
+            if "tp_price" in db_values:
+                state["tp_price"] = safe_float(db_values["tp_price"])
+            if "sl_price" in db_values:
+                state["sl_price"] = safe_float(db_values["sl_price"])
+            if "tp_order_id" in db_values:
+                state["tp_order_id"] = None if db_values["tp_order_id"] == "None" else db_values["tp_order_id"]
+            if "sl_order_id" in db_values:
+                state["sl_order_id"] = None if db_values["sl_order_id"] == "None" else db_values["sl_order_id"]
+            if "entry_time" in db_values:
+                state["entry_time"] = None if db_values["entry_time"] == "None" else db_values["entry_time"]
+            if "contracts" in db_values:
+                state["contracts"] = None if db_values["contracts"] == "None" else db_values["contracts"]
+            if "balance_before_trade" in db_values:
+                state["balance_before_trade"] = safe_float(db_values["balance_before_trade"])
+    except Exception as e:
+        print(f"sync_state_from_db error: {e}", flush=True)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
+        sync_state_from_db()
         data = request.get_json(force=True, silent=True)
         if not data:
             return jsonify({"error": "invalid json"}), 400
@@ -497,6 +587,7 @@ def load_trades():
 
 @app.route("/", methods=["GET"])
 def dashboard():
+    sync_state_from_db()
     bal_result = coinbase.get_balance()
     balance_data = (bal_result.get("result") or {}).get("balance_summary", {})
     cbi_balance = float(balance_data.get("futures_buying_power", {}).get("value", 0))
@@ -546,6 +637,8 @@ def dashboard():
         f"<div class='c'><div class='l'>Available Balance (USD)</div><div class='v'>{fmt(cbi_balance)}</div></div>"
         f"<div class='c'><div class='l'>Wins</div><div class='v'>{state['wins']}</div></div>"
         f"<div class='c'><div class='l'>Losses</div><div class='v'>{state['losses']}</div></div>"
+        f"<div class='c'><div class='l'>Scratches</div><div class='v'>{state['scratches']}</div></div>"
+        f"<div class='c'><div class='l'>Ties</div><div class='v'>{state['ties']}</div></div>"
         f"<div class='c'><div class='l'>Win Rate</div><div class='v'>{win_rate}</div></div>"
         f"<div class='c'><div class='l'>In Trade</div><div class='v'>{trade}</div></div>"
         f"<div class='c'><div class='l'>Live TP</div><div class='v'>{tp_display}</div></div>"
@@ -656,6 +749,26 @@ def close_manual():
         state["balance_before_trade"] = None
 
     save_state()
+    # FIX (Sep 19 2026): scratch_armed lives in coinbase_bot_state but is
+    # only managed by worker.py's update_bot_state() - this recovery route
+    # never touched it, so a True flag from a trade that got stuck OPEN
+    # and was closed here manually carried straight into the NEXT trade,
+    # skipping the 0.5% arm requirement entirely (confirmed: a SHORT
+    # scratched 2 seconds after opening because scratch_armed was still
+    # True from the previous trade). Explicitly reset it here too.
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO coinbase_bot_state (key, value) VALUES ('scratch_armed', 'False')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to reset scratch_armed in close_manual: {e}")
+
     return jsonify({"status": "closed", "state": {k: v for k, v in state.items() if k not in ("green_anchor", "red_anchor")}})
 
 
@@ -687,6 +800,22 @@ def resync():
         state["entry_time"] = entry_time
 
     save_state()
+    # FIX (Sep 19 2026): same gap as close_manual - reset scratch_armed
+    # here too, since this route also starts tracking a "new" trade in
+    # the state, and a stale True would skip the 0.5% arm requirement.
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO coinbase_bot_state (key, value) VALUES ('scratch_armed', 'False')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to reset scratch_armed in resync: {e}")
+
     return jsonify({"status": "resynced", "state": {k: v for k, v in state.items() if k not in ("green_anchor", "red_anchor")}})
 
 
