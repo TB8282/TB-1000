@@ -175,8 +175,14 @@ def force_close_at_market(data, bracket_order_id, side, trade_contracts, status_
     exit_price = ticker_result["result"]["price"] if not ticker_result.get("error") else 0
 
     close_trade_record(status_label, exit_price)
+    # FIX (Sep 19 2026): full state hygiene - clear every trade-specific
+    # field on close, not just the ones that happened to matter for one
+    # bug at a time. entry_price/entry_time/contracts were staying stale
+    # here even though tp_price/sl_price were already fixed.
     update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
                       sl_order_id=None, entry_order_id=None,
+                      tp_price=None, sl_price=None, entry_price=None,
+                      entry_time=None, contracts=None,
                       balance_before_trade=None, scratch_armed=False)
     print(f"TRADE CLOSED: {status_label}")
 
@@ -223,6 +229,8 @@ def check_current_trade():
             close_trade_record("TIE", exit_price)
             update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
                               sl_order_id=None, entry_order_id=None,
+                              tp_price=None, sl_price=None, entry_price=None,
+                              entry_time=None, contracts=None,
                               balance_before_trade=None, scratch_armed=False)
             return
 
@@ -237,6 +245,8 @@ def check_current_trade():
             close_trade_record("WIN", exit_price)
             update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
                               sl_order_id=None, entry_order_id=None,
+                              tp_price=None, sl_price=None, entry_price=None,
+                              entry_time=None, contracts=None,
                               balance_before_trade=None, wins=wins, scratch_armed=False)
         else:
             status_label = "LOSS"
@@ -244,6 +254,8 @@ def check_current_trade():
             close_trade_record("LOSS", exit_price)
             update_bot_state(in_trade=False, trade_side=None, tp_order_id=None,
                               sl_order_id=None, entry_order_id=None,
+                              tp_price=None, sl_price=None, entry_price=None,
+                              entry_time=None, contracts=None,
                               balance_before_trade=None, losses=losses, scratch_armed=False)
 
         print(f"TRADE CLOSED: {status_label} | balance_before=${balance_before_trade:.2f} "
