@@ -778,7 +778,19 @@ def resync():
     Manually re-syncs state to reflect a real trade already open on Coinbase
     but missing from the DB/in-memory state (recovery tool, not normal flow).
     Visit as a URL with query params, e.g.:
-    /resync?side=LONG&entry_price=77205&tp_price=77785&sl_price=76625&contracts=1&entry_time=2026-09-12 20:15
+    /resync?side=LONG&entry_price=77205&tp_price=77785&sl_price=76625&contracts=1&entry_time=2026-09-12 20:15&bracket_order_id=abc123
+
+    FIX (Sep 19 2026): this route used to leave entry_order_id, tp_order_id,
+    sl_order_id, and balance_before_trade untouched - meaning a resync
+    could silently carry over a stale order ID from whatever trade came
+    before it, causing worker.py to poll the WRONG order for this "new"
+    trade. bracket_order_id is now an optional param; if not given, all
+    order-ID fields are explicitly cleared to None rather than left stale.
+    balance_before_trade is also explicitly cleared (worker.py needs a
+    real value here to determine WIN/LOSS - the same-named recovery gap
+    close_manual/check_current_trade already print a WARNING for when
+    it's missing, so clearing it rather than leaving a wrong stale number
+    is the safer failure mode).
     """
     side = request.args.get("side")
     entry_price = safe_float(request.args.get("entry_price"))
@@ -786,6 +798,7 @@ def resync():
     sl_price = safe_float(request.args.get("sl_price"))
     contracts = request.args.get("contracts")
     entry_time = request.args.get("entry_time")
+    bracket_order_id = request.args.get("bracket_order_id")
 
     if not side or entry_price is None:
         return jsonify({"error": "missing required params: side, entry_price"}), 400
@@ -798,6 +811,10 @@ def resync():
         state["sl_price"] = sl_price
         state["contracts"] = contracts
         state["entry_time"] = entry_time
+        state["entry_order_id"] = bracket_order_id
+        state["tp_order_id"] = bracket_order_id
+        state["sl_order_id"] = bracket_order_id
+        state["balance_before_trade"] = None
 
     save_state()
     # FIX (Sep 19 2026): same gap as close_manual - reset scratch_armed
