@@ -32,6 +32,18 @@ cancelled bracket means one side filled (real trades don't get
 cancelled with no fill mid-flight), so WIN/LOSS is determined the
 same way as before (balance before vs after).
 
+FIX (Sep 20 2026): balance_before/current comparison was reading
+current balance IMMEDIATELY upon detecting the bracket close, before
+Coinbase finished settling the freed margin + P&L back into
+futures_buying_power. This produced a transient low balance snapshot
+(margin still mostly locked) that could look like a big loss even on
+a real TP win - confirmed on a real trade that exited at TP ($80,950,
++$4.64 actual gain per Coinbase transaction history) but got logged
+as LOSS because balance read $96.24 mid-settlement instead of the
+real post-settle ~$296. Fixed: after detecting bracket close, wait 2s
+and poll up to 3 times before comparing, giving Coinbase's settlement
+time to complete.
+
 SCRATCH RULE (unchanged):
 Once a trade's unrealized profit reaches SCRATCH_ARM_PCT (0.5%), the
 trade is "armed." If price then retraces back to the entry price while
@@ -53,6 +65,8 @@ from coinbase_client import CoinbaseClient, PRODUCT_ID
 LEVERAGE = 10
 PROFIT_TIMEOUT_HOURS = float(os.environ.get("PROFIT_TIMEOUT_HOURS", 24))
 SCRATCH_ARM_PCT = 0.005  # 0.5% - once profit reaches this, arm the scratch watcher
+BALANCE_SETTLE_WAIT_SECONDS = 2  # FIX (Sep 20 2026): give Coinbase time to settle before reading balance
+BALANCE_SETTLE_MAX_ATTEMPTS = 3
 
 CDP_API_KEY_NAME = os.environ.get("CDP_API_KEY_NAME")
 CDP_API_KEY_PRIVATE_KEY = os.environ.get("CDP_API_KEY_PRIVATE_KEY")
@@ -234,9 +248,22 @@ def check_current_trade():
                               balance_before_trade=None, scratch_armed=False)
             return
 
-        current_balance = get_current_balance()
+        # FIX (Sep 20 2026): do not read balance immediately - Coinbase
+        # needs a moment to settle freed margin + P&L back into
+        # futures_buying_power after a bracket closes. Reading too early
+        # produced a transient low snapshot that misclassified a real
+        # win as a LOSS. Wait, then poll up to BALANCE_SETTLE_MAX_ATTEMPTS
+        # times, using the last successfully fetched value.
+        current_balance = None
+        for attempt in range(1, BALANCE_SETTLE_MAX_ATTEMPTS + 1):
+            time.sleep(BALANCE_SETTLE_WAIT_SECONDS)
+            current_balance = get_current_balance()
+            print(f"Balance settle check {attempt}/{BALANCE_SETTLE_MAX_ATTEMPTS}: {current_balance}")
+            if current_balance is not None:
+                break
+
         if current_balance is None:
-            print("WARNING: could not fetch current balance to determine WIN/LOSS - will retry next poll.")
+            print("WARNING: could not fetch current balance to determine WIN/LOSS after retries - will retry next poll.")
             return
 
         if current_balance > balance_before_trade:
