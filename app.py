@@ -513,6 +513,24 @@ def webhook():
                     state["green_declining"] = value < state["last_green_value"]
                 state["last_green_value"] = value
 
+                # FIX (Sep 20 2026): a RED anchor represents "the trend
+                # looks like it might be turning down." If green prints
+                # HIGHER again (green_declining goes False) while a red
+                # anchor is already sitting active, that's real evidence
+                # the uptrend hasn't actually broken - the anchor is stale
+                # and must NOT be allowed to sit there waiting for a much
+                # later red dot. Previously this was only checked at the
+                # moment a NEW red dot arrived (Rule 9); now it also kills
+                # an already-active red anchor in real time, the instant
+                # green rises again - confirmed real chart example: a red
+                # anchor followed by a second, lower red dot while green
+                # was still clearly climbing underneath should never have
+                # stayed active.
+                if not state["green_declining"] and state["red_anchor"] is not None:
+                    print(f"RED anchor invalidated - green rose again ({round(value,2)}) "
+                          f"before a SHORT trigger fired")
+                    state["red_anchor"] = None
+
                 anchor = state["green_anchor"]
                 if anchor is None:
                     if value <= -ANCHOR_LEVEL:
@@ -545,9 +563,20 @@ def webhook():
             elif dot == "red":
                 anchor = state["red_anchor"]
                 if anchor is None:
-                    if value >= ANCHOR_LEVEL:
+                    # FIX (Sep 20 2026): a red dot >= ANCHOR_LEVEL only
+                    # forms a valid anchor if green is ALREADY declining
+                    # at that moment - if green is still rising, the trend
+                    # hasn't turned yet and this dot must be ignored
+                    # entirely, not stored as an anchor waiting for green
+                    # to catch up later. Confirmed real chart example: a
+                    # red dot printing high while green was still climbing
+                    # underneath it should never have become an anchor.
+                    if value >= ANCHOR_LEVEL and state["green_declining"]:
                         state["red_anchor"] = {"value": value}
                         print(f"RED anchor stored: {round(value, 2)}")
+                    elif value >= ANCHOR_LEVEL:
+                        print(f"RED dot >= {ANCHOR_LEVEL} ({round(value,2)}) but green still "
+                              f"rising - anchor NOT formed")
                 elif value < anchor["value"]:
                     if value < TRIGGER_MIN_RED:
                         print(f"RED trigger too low ({round(value,2)}) - anchor kept")
@@ -577,7 +606,7 @@ def webhook():
                         # carrying the trigger value forward.
                         state["red_anchor"] = None
                         trade_side_to_open = "SHORT"
-                elif value >= ANCHOR_LEVEL:
+                elif value >= ANCHOR_LEVEL and state["green_declining"]:
                     state["red_anchor"] = {"value": value}
                     print(f"NEW RED anchor: {round(value, 2)}")
 
