@@ -519,9 +519,13 @@ def webhook():
                 # anchor is already sitting active, that's real evidence
                 # the uptrend hasn't actually broken - the anchor is stale
                 # and must NOT be allowed to sit there waiting for a much
-                # later red dot. This kills an already-active red anchor
-                # in real time, the instant green rises again - separate
-                # from Rule 5's own trigger-time check below.
+                # later red dot. Previously this was only checked at the
+                # moment a NEW red dot arrived (Rule 9); now it also kills
+                # an already-active red anchor in real time, the instant
+                # green rises again - confirmed real chart example: a red
+                # anchor followed by a second, lower red dot while green
+                # was still clearly climbing underneath should never have
+                # stayed active.
                 if not state["green_declining"] and state["red_anchor"] is not None:
                     print(f"RED anchor invalidated - green rose again ({round(value,2)}) "
                           f"before a SHORT trigger fired")
@@ -543,7 +547,33 @@ def webhook():
                     if value >= 0:
                         print(f"GREEN trigger crossed zero ({round(value,2)}) - ignored, anchor kept")
                     elif state["in_trade"]:
-                        print("Already in trade - ignored")
+                        # FIX (Sep 22 2026): this dot would have been a valid
+                        # LONG trigger, but got skipped (one trade at a time).
+                        # Previously nothing happened here, so the OLD anchor
+                        # stayed the comparison point - meaning a LATER dot
+                        # that's still above the old anchor, but actually
+                        # LOWER than this ignored one, could wrongly fire
+                        # once the trade closed, even though the real dot
+                        # sequence had declined. Confirmed real example:
+                        # anchor -59.9, ignored dots -51 then -44 while
+                        # in-trade, then -50 after close - old code would
+                        # have fired -50 against the stale -59.9 anchor,
+                        # even though -50 is lower than the -44 already seen.
+                        # Fix: this ignored dot becomes the new anchor if it
+                        # still clears -ANCHOR_LEVEL (tracks the highest
+                        # qualifying dot seen while in-trade). If it doesn't
+                        # clear -ANCHOR_LEVEL, the whole setup is invalid -
+                        # anchor goes to None, must wait for a fresh
+                        # <=-ANCHOR_LEVEL dot to restart, same as the
+                        # invalidation logic elsewhere.
+                        if value <= -ANCHOR_LEVEL:
+                            state["green_anchor"] = {"value": value}
+                            print(f"Already in trade - ignored trigger, but anchor updated to "
+                                  f"{round(value,2)} (highest qualifying dot seen in-trade)")
+                        else:
+                            state["green_anchor"] = None
+                            print(f"Already in trade - ignored trigger ({round(value,2)}), doesn't "
+                                  f"clear -{ANCHOR_LEVEL} - ANCHOR INVALIDATED, must re-anchor")
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
                         # Anchor resets to None after a valid trigger, instead
@@ -559,12 +589,16 @@ def webhook():
             elif dot == "red":
                 anchor = state["red_anchor"]
                 if anchor is None:
+                    # FIX (Sep 21 2026): reverted the Sep 20 formation gate.
                     # A red dot >= ANCHOR_LEVEL always forms an anchor,
                     # regardless of green's direction at that instant -
-                    # green's direction is confirmed AFTER the anchor
-                    # forms, by (a) the real-time kill-on-rise check above
-                    # on the very next green dot, and (b) Rule 5's
-                    # trigger-time confirmation below.
+                    # green's direction is confirmed AFTER the anchor forms,
+                    # by (a) the real-time kill-on-rise check below on the
+                    # very next green dot, and (b) Rule 5's existing trigger-
+                    # time confirmation. Gating formation itself was wrong -
+                    # confirmed real chart example where a valid anchor
+                    # should have formed and then been evaluated on the next
+                    # green dot, not blocked from forming at all.
                     if value >= ANCHOR_LEVEL:
                         state["red_anchor"] = {"value": value}
                         print(f"RED anchor stored: {round(value, 2)}")
