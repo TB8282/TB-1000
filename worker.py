@@ -54,13 +54,38 @@ TIE RULE (unchanged):
 If a trade has been open longer than PROFIT_TIMEOUT_HOURS, it is
 force-closed at market UNCONDITIONALLY - win, loss, or flat - and
 logged as a TIE.
+
+EOD CUTOFF RULE (added Sep 22 2026):
+Coinbase's overnight margin requirements are much stricter than
+intraday (confirmed real near-liquidation incident: a SHORT's overnight
+liquidation estimate had already been breached by just a 0.72% adverse
+move while using the same position sizing that was safe intraday).
+Any trade opened during today's daytime session (entry time < 4pm ET)
+that is still open at or after 3:15pm ET is force-closed at market
+UNCONDITIONALLY, regardless of P&L - same closing mechanism as the TIE
+rule, logged under its own status so how often this fires is visible
+separately. This check runs on every 5s poll cycle (not a one-shot
+timer) and fails toward closing: any error just means it gets retried
+next cycle rather than silently skipped. Uses zoneinfo (America/New_York)
+rather than a fixed UTC offset, so DST transitions are handled correctly
+- Render's underlying clock is UTC, and a fixed-offset approach was the
+same class of bug behind the earlier 4-hour dashboard timestamp issue.
+Bounded to only trades entered TODAY before 4pm ET, so a legitimate
+trade opened last night under the (lower-leverage) overnight regime is
+never mistakenly force-closed by this rule.
 """
 
 import os
 import time
 import psycopg2
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from coinbase_client import CoinbaseClient, PRODUCT_ID
+
+ET = ZoneInfo("America/New_York")
+EOD_FORCE_CLOSE_HOUR_ET = 15
+EOD_FORCE_CLOSE_MINUTE_ET = 15  # 3:15 PM ET
+DAYTIME_SESSION_END_HOUR_ET = 16  # 4:00 PM ET - trades opened at/after this are already under the overnight regime
 
 LEVERAGE = 10
 PROFIT_TIMEOUT_HOURS = float(os.environ.get("PROFIT_TIMEOUT_HOURS", 24))
@@ -201,6 +226,41 @@ def force_close_at_market(data, bracket_order_id, side, trade_contracts, status_
     print(f"TRADE CLOSED: {status_label}")
 
 
+def is_eod_force_close_due(entry_time_str):
+    """
+    Returns True if the currently open trade was entered today, before
+    the 4pm ET daytime/overnight boundary, and the current time is at or
+    past 3:15pm ET - meaning it must be force-closed now, regardless of
+    P&L, before Coinbase's overnight margin shift.
+
+    entry_time is stored by app.py as a naive UTC string
+    ("%Y-%m-%d %H:%M" from datetime.utcnow()) - explicitly attach UTC
+    tzinfo before converting to ET so this is correct across DST, rather
+    than assuming a fixed hour offset.
+
+    Bounded by same-calendar-day AND entry-before-4pm so a trade that
+    was legitimately opened last night under the overnight regime is
+    never caught by this check, even if the worker is still polling
+    well past 3:15pm.
+    """
+    if not entry_time_str or entry_time_str == "None":
+        return False
+    try:
+        entry_time_utc = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("UTC"))
+    except Exception as e:
+        print(f"EOD cutoff check: could not parse entry_time ({entry_time_str}): {e}")
+        return False
+
+    entry_time_et = entry_time_utc.astimezone(ET)
+    now_et = datetime.now(ET)
+
+    same_day = now_et.date() == entry_time_et.date()
+    entered_before_overnight_shift = entry_time_et.hour < DAYTIME_SESSION_END_HOUR_ET
+    past_cutoff = (now_et.hour, now_et.minute) >= (EOD_FORCE_CLOSE_HOUR_ET, EOD_FORCE_CLOSE_MINUTE_ET)
+
+    return same_day and entered_before_overnight_shift and past_cutoff
+
+
 def check_current_trade():
     data = load_bot_state()
     if data.get("in_trade") != "True":
@@ -219,6 +279,16 @@ def check_current_trade():
 
     if not bracket_order_id or bracket_order_id == "None":
         print("WARNING: Missing bracket order id, cannot monitor this trade properly.")
+        return
+
+    # EOD CUTOFF: checked first, every poll cycle, before anything else -
+    # this must fire regardless of bracket status, scratch state, or the
+    # 24hr TIE timer. Deliberately placed ahead of the order-status query
+    # below so it never gets skipped by an unrelated API error further down.
+    if is_eod_force_close_due(entry_time_str):
+        print(f"EOD CUTOFF TRIGGERED - trade entered {entry_time_str} UTC still open at/after "
+              f"3:15pm ET - force-closing before overnight margin shift")
+        force_close_at_market(data, bracket_order_id, side, trade_contracts, "EOD_CUTOFF")
         return
 
     result = coinbase.query_orders([bracket_order_id])
