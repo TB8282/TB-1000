@@ -4,9 +4,29 @@ import threading
 import time
 import psycopg2
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from coinbase_client import CoinbaseClient, PRODUCT_ID
 
 app = Flask(__name__)
+
+# FIX (Sep 22 2026): overnight margin/liquidation protection, part 1 of 2
+# (part 2 is the force-close in worker.py). No new trades are allowed to
+# open between 1pm and 4pm ET - this leaves enough runway for a trade
+# opened right at 1pm to hit its own TP/SL naturally before the 3:15pm
+# force-close cutoff, rather than every trade in that window getting cut
+# off artificially. After 4pm, Coinbase's overnight margin regime is
+# already in effect, so new entries are safe again. Uses zoneinfo (not a
+# fixed UTC offset) so this correctly handles EST/EDT daylight saving -
+# a fixed-offset approach was the exact class of bug behind the earlier
+# 4-hour dashboard timestamp issue.
+ET = ZoneInfo("America/New_York")
+NEW_ENTRY_BLOCK_START_HOUR_ET = 13  # 1:00 PM ET
+NEW_ENTRY_BLOCK_END_HOUR_ET = 16    # 4:00 PM ET
+
+
+def is_new_entry_blocked():
+    now_et = datetime.now(ET)
+    return NEW_ENTRY_BLOCK_START_HOUR_ET <= now_et.hour < NEW_ENTRY_BLOCK_END_HOUR_ET
 
 # ============ CONFIRMED RULES ============
 ANCHOR_LEVEL = 35
@@ -546,9 +566,13 @@ def webhook():
                     # time. Replaces the old TRIGGER_MAX_GREEN (+15) cap.
                     if value >= 0:
                         print(f"GREEN trigger crossed zero ({round(value,2)}) - ignored, anchor kept")
-                    elif state["in_trade"]:
-                        # FIX (Sep 22 2026): this dot would have been a valid
-                        # LONG trigger, but got skipped (one trade at a time).
+                    elif state["in_trade"] or is_new_entry_blocked():
+                        # FIX (Sep 22 2026): also blocked during the 1pm-4pm ET
+                        # no-new-entries window (overnight liquidation
+                        # protection) - treated exactly like being in-trade,
+                        # since the anchor-tracking need is identical either
+                        # way: this dot would have been a valid LONG trigger,
+                        # but got skipped (one trade at a time, or time-blocked).
                         # Previously nothing happened here, so the OLD anchor
                         # stayed the comparison point - meaning a LATER dot
                         # that's still above the old anchor, but actually
@@ -605,8 +629,11 @@ def webhook():
                 elif value < anchor["value"]:
                     if value < TRIGGER_MIN_RED:
                         print(f"RED trigger too low ({round(value,2)}) - anchor kept")
-                    elif state["in_trade"]:
-                        print("Already in trade - ignored")
+                    elif state["in_trade"] or is_new_entry_blocked():
+                        # FIX (Sep 22 2026): also blocked during the 1pm-4pm ET
+                        # no-new-entries window (overnight liquidation
+                        # protection), same treatment as being in-trade.
+                        print("Already in trade or in no-new-entries window (1pm-4pm ET) - ignored")
                     elif not state["green_declining"]:
                         # RULE 5 (confirmation) + RULE 9 (consecutive dot
                         # invalidation): don't trust a SHORT until a green
