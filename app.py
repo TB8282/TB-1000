@@ -600,11 +600,28 @@ def webhook():
                                   f"clear -{ANCHOR_LEVEL} - ANCHOR INVALIDATED, must re-anchor")
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        # Anchor resets to None after a valid trigger, instead
-                        # of carrying the trigger's value forward - an anchor
-                        # must sit outside the -35/+35 band, and the trigger
-                        # value itself is always inside that band.
-                        state["green_anchor"] = None
+                        # FIX (Sep 24 2026): the OLD comment here assumed a
+                        # trigger's value always sits inside the -35/+35
+                        # band - true when the trigger just barely cleared
+                        # the anchor, but NOT true when the trigger itself
+                        # is <=-35 (e.g. anchor -80, trigger -60 - the
+                        # trigger clears -35 on its own). Confirmed real
+                        # example: that -60 trigger should become the next
+                        # anchor immediately, not reset to None, since no
+                        # dot printed between the anchor and it that would
+                        # otherwise invalidate the setup. If the trigger
+                        # does NOT clear -35 on its own, it still resets to
+                        # None exactly as before - nothing changes for that
+                        # case. Once this becomes the anchor, all the
+                        # existing rules apply normally: a later lower dot
+                        # replaces it, a later higher (still negative) dot
+                        # becomes the next trigger, and a dot landing
+                        # between -35 and 0 while in-trade still voids it
+                        # to None - none of that logic changes here.
+                        if value <= -ANCHOR_LEVEL:
+                            state["green_anchor"] = {"value": value}
+                        else:
+                            state["green_anchor"] = None
                         trade_side_to_open = "LONG"
                 elif value <= -ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value}
