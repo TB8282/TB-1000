@@ -222,43 +222,40 @@ def force_close_at_market(data, bracket_order_id, side, trade_contracts, status_
                       sl_order_id=None, entry_order_id=None,
                       tp_price=None, sl_price=None, entry_price=None,
                       entry_time=None, contracts=None,
-                      balance_before_trade=None, scratch_armed=False)
+                      balance_before_trade=None, scratch_armed=False, highest_profit_pct=0)
     print(f"TRADE CLOSED: {status_label}")
 
 
 def is_eod_force_close_due(entry_time_str):
     """
-    Returns True if the currently open trade was entered today, before
-    the 4pm ET daytime/overnight boundary, and the current time is at or
-    past 3:15pm ET - meaning it must be force-closed now, regardless of
-    P&L, before Coinbase's overnight margin shift.
+    Returns True if it is currently within the 3:15pm-4:00pm ET window,
+    meaning ANY currently open trade must be force-closed now, regardless
+    of P&L, before Coinbase's overnight margin shift.
 
-    entry_time is stored by app.py as a naive UTC string
-    ("%Y-%m-%d %H:%M" from datetime.utcnow()) - explicitly attach UTC
-    tzinfo before converting to ET so this is correct across DST, rather
-    than assuming a fixed hour offset.
+    FIX (Sep 25 2026): removed the old same-calendar-day + entered-before-4pm
+    restriction. That version only caught a trade if it opened THAT SAME
+    day before 4pm - a trade opened at, say, 9pm and still open through
+    the next day's 4pm was never caught by this check at all, since its
+    entry date no longer matched "today." Confirmed real gap: a trade
+    left open overnight would ride through the very margin shift this
+    function exists to protect against, day after day, with only the
+    24hr TIE rule as a backstop (and only once 24 hours had passed).
 
-    Bounded by same-calendar-day AND entry-before-4pm so a trade that
-    was legitimately opened last night under the overnight regime is
-    never caught by this check, even if the worker is still polling
-    well past 3:15pm.
+    Now this checks ONLY the current time-of-day, with no entry-time
+    condition at all - any trade still open when the clock enters
+    3:15pm-4:00pm ET gets closed, whether it opened five minutes ago or
+    five days ago. Bounded to the 3:15-4:00 window itself (not "any time
+    after 3:15") so a trade opened at, say, 8pm the same evening isn't
+    immediately caught the instant this function runs later that night -
+    it only fires within the actual daily window, checked every 5s poll
+    cycle. This also means no trade can ever stay open longer than
+    roughly 24 hours (worst case: opens right after one window closes,
+    caught by the very next one) - the 24hr TIE rule becomes a backstop
+    that should now never actually have a chance to fire.
     """
-    if not entry_time_str or entry_time_str == "None":
-        return False
-    try:
-        entry_time_utc = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("UTC"))
-    except Exception as e:
-        print(f"EOD cutoff check: could not parse entry_time ({entry_time_str}): {e}")
-        return False
-
-    entry_time_et = entry_time_utc.astimezone(ET)
     now_et = datetime.now(ET)
-
-    same_day = now_et.date() == entry_time_et.date()
-    entered_before_overnight_shift = entry_time_et.hour < DAYTIME_SESSION_END_HOUR_ET
-    past_cutoff = (now_et.hour, now_et.minute) >= (EOD_FORCE_CLOSE_HOUR_ET, EOD_FORCE_CLOSE_MINUTE_ET)
-
-    return same_day and entered_before_overnight_shift and past_cutoff
+    return (now_et.hour, now_et.minute) >= (EOD_FORCE_CLOSE_HOUR_ET, EOD_FORCE_CLOSE_MINUTE_ET) \
+        and now_et.hour < DAYTIME_SESSION_END_HOUR_ET
 
 
 def check_current_trade():
@@ -273,7 +270,7 @@ def check_current_trade():
     entry_time_str = data.get("entry_time")
     entry_price = float(data.get("entry_price", 0))
     trade_contracts = data.get("contracts")
-    scratch_armed = data.get("scratch_armed") == "True"
+    highest_profit_pct = float(data.get("highest_profit_pct", 0) or 0)
     balance_before_trade = data.get("balance_before_trade")
     balance_before_trade = float(balance_before_trade) if balance_before_trade not in (None, "None") else None
 
@@ -315,7 +312,7 @@ def check_current_trade():
                               sl_order_id=None, entry_order_id=None,
                               tp_price=None, sl_price=None, entry_price=None,
                               entry_time=None, contracts=None,
-                              balance_before_trade=None, scratch_armed=False)
+                              balance_before_trade=None, scratch_armed=False, highest_profit_pct=0)
             return
 
         # FIX (Sep 20 2026): do not read balance immediately - Coinbase
@@ -344,7 +341,7 @@ def check_current_trade():
                               sl_order_id=None, entry_order_id=None,
                               tp_price=None, sl_price=None, entry_price=None,
                               entry_time=None, contracts=None,
-                              balance_before_trade=None, wins=wins, scratch_armed=False)
+                              balance_before_trade=None, wins=wins, scratch_armed=False, highest_profit_pct=0)
         else:
             status_label = "LOSS"
             losses = int(data.get("losses", 0)) + 1
@@ -353,7 +350,7 @@ def check_current_trade():
                               sl_order_id=None, entry_order_id=None,
                               tp_price=None, sl_price=None, entry_price=None,
                               entry_time=None, contracts=None,
-                              balance_before_trade=None, losses=losses, scratch_armed=False)
+                              balance_before_trade=None, losses=losses, scratch_armed=False, highest_profit_pct=0)
 
         print(f"TRADE CLOSED: {status_label} | balance_before=${balance_before_trade:.2f} "
               f"-> current=${current_balance:.2f}")
@@ -370,21 +367,33 @@ def check_current_trade():
         profit_pct = ((current_price - entry_price) / entry_price if side == "LONG"
                       else (entry_price - current_price) / entry_price)
 
-        if not scratch_armed and profit_pct >= SCRATCH_ARM_PCT:
-            scratch_armed = True
-            update_bot_state(scratch_armed=True)
-            print(f"SCRATCH ARMED at {round(profit_pct*100, 3)}% profit")
+        # FIX (Sep 25 2026): replaced the single breakeven-only retrace
+        # with tiered profit-locking floors. Real backtest evidence found
+        # roughly half of all TIE/scratch closes were near-misses that
+        # ran to 0.68-0.72% (right at the edge of the 0.75% TP) before
+        # giving the whole move back for a flat/fee-only close. Tracks
+        # the HIGHEST profit % actually reached (not sequential arming
+        # steps), so a fast price move that jumps straight from 0.4% to
+        # 0.72% between polls still gets the correct floor immediately,
+        # not whatever the last-checked step happened to be.
+        if profit_pct > highest_profit_pct:
+            highest_profit_pct = profit_pct
+            update_bot_state(highest_profit_pct=highest_profit_pct)
 
-        if scratch_armed:
-            retraced_to_entry = (
-                (side == "LONG" and current_price <= entry_price) or
-                (side == "SHORT" and current_price >= entry_price)
-            )
-            if retraced_to_entry:
-                print(f"SCRATCH TRIGGERED - price retraced to entry ({entry_price})")
-                force_close_at_market(data, bracket_order_id, side,
-                                       trade_contracts, "SCRATCH")
-                return
+        floor_pct = None
+        if highest_profit_pct >= 0.007:
+            floor_pct = 0.0030
+        elif highest_profit_pct >= 0.006:
+            floor_pct = 0.0015
+        elif highest_profit_pct >= SCRATCH_ARM_PCT:
+            floor_pct = 0.0
+
+        if floor_pct is not None and profit_pct <= floor_pct:
+            print(f"RETRACE FLOOR HIT - peaked at {round(highest_profit_pct*100,3)}%, "
+                  f"floor was {round(floor_pct*100,3)}%, now at {round(profit_pct*100,3)}% - closing")
+            force_close_at_market(data, bracket_order_id, side,
+                                   trade_contracts, "SCRATCH")
+            return
 
     # TIE rule - unconditional close after PROFIT_TIMEOUT_HOURS, regardless of P&L
     if entry_time_str and entry_time_str != "None":
