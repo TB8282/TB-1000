@@ -29,9 +29,18 @@ def is_new_entry_blocked():
     return NEW_ENTRY_BLOCK_START_HOUR_ET <= now_et.hour < NEW_ENTRY_BLOCK_END_HOUR_ET
 
 # ============ CONFIRMED RULES ============
-ANCHOR_LEVEL = 35
-TRIGGER_MAX_GREEN = 15
-TRIGGER_MIN_RED = -15
+# FIX (Sep 25 2026): ANCHOR_LEVEL used to be one shared constant for both
+# sides. Backtesting confirmed LONG and SHORT now use different numbers,
+# so this is split into two. RED/SHORT keeps the original 35, unchanged.
+# GREEN/LONG moves from -35 to -20 (anchor threshold), and gets a new
+# upper bound: the old rule flatly rejected any trigger at 0 or above;
+# now triggers are allowed anywhere in the range up to +20, not just
+# strictly negative.
+RED_ANCHOR_LEVEL = 35
+GREEN_ANCHOR_LEVEL = 20
+GREEN_TRIGGER_MAX = 20   # a green trigger at or above this is ignored, same as the old ">= 0" cutoff, just moved
+TRIGGER_MIN_RED = -25   # was -15; backtesting confirmed the wider range
+RED_MIN_GAP = 10        # anchor and trigger must be at least this far apart
 TP_PCT = 0.0075            # 0.75%
 SL_PCT = 0.0075            # 0.75%
 LEVERAGE = 10              # requested leverage for preview/order calls; ACTUAL
@@ -525,12 +534,25 @@ def webhook():
 
             if dot == "green":
                 # RULE 5 tracking: update the green-dot-declining flag on
-                # EVERY green dot, regardless of anchor state. This tracks
-                # whether the most recent green dot is lower than the one
-                # before it - used by the SHORT trigger below to confirm
-                # an uptrend has actually broken before trusting a SHORT.
+                # EVERY green dot, regardless of anchor state. Tracks
+                # whether green has shown real evidence of turning down -
+                # used by the SHORT trigger below to confirm an uptrend
+                # has actually broken before trusting a SHORT.
+                #
+                # FIX (Sep 25 2026): declining is now confirmed EITHER way
+                # (an OR, not a replacement of the original check):
+                # (a) this dot is lower than the one right before it, OR
+                # (b) this dot is negative (below zero), regardless of
+                # slope. Confirmed real example: a green dot ticks UP
+                # slightly from the previous one (fails the slope check)
+                # but is still negative - that alone should still count
+                # as declining. Flagged as a rare case, not the common
+                # path, but a real one that the old slope-only check
+                # would have wrongly blocked a valid SHORT for.
                 if state["last_green_value"] is not None:
-                    state["green_declining"] = value < state["last_green_value"]
+                    state["green_declining"] = (value < state["last_green_value"]) or (value < 0)
+                else:
+                    state["green_declining"] = value < 0
                 state["last_green_value"] = value
 
                 # FIX (Sep 20 2026): a RED anchor represents "the trend
@@ -553,19 +575,19 @@ def webhook():
 
                 anchor = state["green_anchor"]
                 if anchor is None:
-                    if value <= -ANCHOR_LEVEL:
+                    if value <= -GREEN_ANCHOR_LEVEL:
                         state["green_anchor"] = {"value": value}
                         print(f"GREEN anchor stored: {round(value, 2)}")
                 elif value > anchor["value"]:
-                    # RULE 6: the trigger must stay on the SAME SIDE OF ZERO
-                    # as the anchor itself (anchor is always negative, since
-                    # it required value <= -ANCHOR_LEVEL to be set). A green
-                    # dot that has crossed to positive (>= 0) is ignored
-                    # entirely as a trigger candidate - not treated as
-                    # invalidating the anchor, just not a valid trigger this
-                    # time. Replaces the old TRIGGER_MAX_GREEN (+15) cap.
-                    if value >= 0:
-                        print(f"GREEN trigger crossed zero ({round(value,2)}) - ignored, anchor kept")
+                    # FIX (Sep 25 2026): the trigger ceiling moved from
+                    # "must stay negative" (>= 0 was ignored) to
+                    # "must stay below +20" - backtesting confirmed a
+                    # trigger firing anywhere up to +20 still works,
+                    # not just strictly negative values. Anything at or
+                    # above GREEN_TRIGGER_MAX is still ignored, same as
+                    # before, just at a different line.
+                    if value >= GREEN_TRIGGER_MAX:
+                        print(f"GREEN trigger >= {GREEN_TRIGGER_MAX} ({round(value,2)}) - ignored, anchor kept")
                     elif state["in_trade"] or is_new_entry_blocked():
                         # FIX (Sep 22 2026): also blocked during the 1pm-4pm ET
                         # no-new-entries window (overnight liquidation
@@ -573,57 +595,34 @@ def webhook():
                         # since the anchor-tracking need is identical either
                         # way: this dot would have been a valid LONG trigger,
                         # but got skipped (one trade at a time, or time-blocked).
-                        # Previously nothing happened here, so the OLD anchor
-                        # stayed the comparison point - meaning a LATER dot
-                        # that's still above the old anchor, but actually
-                        # LOWER than this ignored one, could wrongly fire
-                        # once the trade closed, even though the real dot
-                        # sequence had declined. Confirmed real example:
-                        # anchor -59.9, ignored dots -51 then -44 while
-                        # in-trade, then -50 after close - old code would
-                        # have fired -50 against the stale -59.9 anchor,
-                        # even though -50 is lower than the -44 already seen.
-                        # Fix: this ignored dot becomes the new anchor if it
-                        # still clears -ANCHOR_LEVEL (tracks the highest
-                        # qualifying dot seen while in-trade). If it doesn't
-                        # clear -ANCHOR_LEVEL, the whole setup is invalid -
-                        # anchor goes to None, must wait for a fresh
-                        # <=-ANCHOR_LEVEL dot to restart, same as the
-                        # invalidation logic elsewhere.
-                        if value <= -ANCHOR_LEVEL:
+                        # This ignored dot becomes the new anchor if it still
+                        # clears -GREEN_ANCHOR_LEVEL (tracks the highest
+                        # qualifying dot seen while in-trade). If it doesn't,
+                        # the whole setup is invalid - anchor goes to None,
+                        # must wait for a fresh qualifying dot to restart.
+                        if value <= -GREEN_ANCHOR_LEVEL:
                             state["green_anchor"] = {"value": value}
                             print(f"Already in trade - ignored trigger, but anchor updated to "
                                   f"{round(value,2)} (highest qualifying dot seen in-trade)")
                         else:
                             state["green_anchor"] = None
                             print(f"Already in trade - ignored trigger ({round(value,2)}), doesn't "
-                                  f"clear -{ANCHOR_LEVEL} - ANCHOR INVALIDATED, must re-anchor")
+                                  f"clear -{GREEN_ANCHOR_LEVEL} - ANCHOR INVALIDATED, must re-anchor")
                     else:
                         print(f"VALID LONG! Anchor: {round(anchor['value'],2)} Trigger: {round(value,2)}")
-                        # FIX (Sep 24 2026): the OLD comment here assumed a
-                        # trigger's value always sits inside the -35/+35
-                        # band - true when the trigger just barely cleared
-                        # the anchor, but NOT true when the trigger itself
-                        # is <=-35 (e.g. anchor -80, trigger -60 - the
-                        # trigger clears -35 on its own). Confirmed real
-                        # example: that -60 trigger should become the next
-                        # anchor immediately, not reset to None, since no
-                        # dot printed between the anchor and it that would
-                        # otherwise invalidate the setup. If the trigger
-                        # does NOT clear -35 on its own, it still resets to
-                        # None exactly as before - nothing changes for that
-                        # case. Once this becomes the anchor, all the
-                        # existing rules apply normally: a later lower dot
-                        # replaces it, a later higher (still negative) dot
-                        # becomes the next trigger, and a dot landing
-                        # between -35 and 0 while in-trade still voids it
-                        # to None - none of that logic changes here.
-                        if value <= -ANCHOR_LEVEL:
+                        # A firing trigger that independently clears
+                        # -GREEN_ANCHOR_LEVEL becomes the next anchor
+                        # immediately instead of resetting to None -
+                        # confirmed real example: anchor -80, trigger -60
+                        # (which is itself <=-20) should become the next
+                        # anchor right away, since no dot printed between
+                        # them that would otherwise invalidate the setup.
+                        if value <= -GREEN_ANCHOR_LEVEL:
                             state["green_anchor"] = {"value": value}
                         else:
                             state["green_anchor"] = None
                         trade_side_to_open = "LONG"
-                elif value <= -ANCHOR_LEVEL:
+                elif value <= -GREEN_ANCHOR_LEVEL:
                     state["green_anchor"] = {"value": value}
                     print(f"NEW GREEN anchor: {round(value, 2)}")
 
@@ -631,7 +630,7 @@ def webhook():
                 anchor = state["red_anchor"]
                 if anchor is None:
                     # FIX (Sep 21 2026): reverted the Sep 20 formation gate.
-                    # A red dot >= ANCHOR_LEVEL always forms an anchor,
+                    # A red dot >= RED_ANCHOR_LEVEL always forms an anchor,
                     # regardless of green's direction at that instant -
                     # green's direction is confirmed AFTER the anchor forms,
                     # by (a) the real-time kill-on-rise check below on the
@@ -640,31 +639,47 @@ def webhook():
                     # confirmed real chart example where a valid anchor
                     # should have formed and then been evaluated on the next
                     # green dot, not blocked from forming at all.
-                    if value >= ANCHOR_LEVEL:
+                    if value >= RED_ANCHOR_LEVEL:
                         state["red_anchor"] = {"value": value}
                         print(f"RED anchor stored: {round(value, 2)}")
                 elif value < anchor["value"]:
-                    if value < TRIGGER_MIN_RED:
-                        print(f"RED trigger too low ({round(value,2)}) - anchor kept")
+                    # FIX (Sep 25 2026): SHORT now requires a minimum
+                    # 10-point gap between the anchor and the trigger -
+                    # a flat gap (e.g. anchor 45, trigger 44) clears the
+                    # basic math but shows no real momentum. There is
+                    # only ever one active anchor at a time (any earlier
+                    # qualifying dot already replaced it), so this is a
+                    # single check against whatever the anchor currently
+                    # is - not a running gap across multiple dots.
+                    gap = anchor["value"] - value
+                    if value < TRIGGER_MIN_RED or gap < RED_MIN_GAP:
+                        # FIX (Sep 25 2026): both "too extreme" (below
+                        # -25) and "gap too small" now RESET the anchor
+                        # to None, instead of the old behavior of just
+                        # ignoring the dot and leaving the anchor active.
+                        # Confirmed: on the SHORT side (unlike LONG), any
+                        # dot that fails to cleanly fire breaks the setup
+                        # entirely - a fresh >=35 red dot is required to
+                        # start over, rather than letting a stale anchor
+                        # sit there waiting for a later dot.
+                        reason = "too low" if value < TRIGGER_MIN_RED else f"gap only {round(gap,2)} (<{RED_MIN_GAP})"
+                        print(f"RED trigger invalid ({round(value,2)}, {reason}) - ANCHOR RESET, must re-anchor")
+                        state["red_anchor"] = None
                     elif state["in_trade"] or is_new_entry_blocked():
-                        # FIX (Sep 22 2026): also blocked during the 1pm-4pm ET
-                        # no-new-entries window (overnight liquidation
-                        # protection), same treatment as being in-trade.
-                        print("Already in trade or in no-new-entries window (1pm-4pm ET) - ignored")
+                        # FIX (Sep 25 2026): also a reset now, not just an
+                        # ignore - a red dot skipped because a trade was
+                        # already open (or the 1pm-4pm window) breaks the
+                        # setup the same way any other failed dot does.
+                        print("Already in trade or in no-new-entries window (1pm-4pm ET) - ANCHOR RESET, must re-anchor")
+                        state["red_anchor"] = None
                     elif not state["green_declining"]:
                         # RULE 5 (confirmation) + RULE 9 (consecutive dot
-                        # invalidation): don't trust a SHORT until a green
-                        # dot has printed lower than the previous green dot
-                        # - confirms the uptrend has actually broken. Unlike
-                        # the old behavior, this dot does NOT just get
-                        # skipped while the anchor stays active - it
-                        # INVALIDATES the whole setup, since red dots after
-                        # an anchor must be consecutive (each one lower
-                        # than the previous). This dot is lower than the
-                        # anchor but can't fire (blocked) and can't itself
-                        # be a valid anchor either (below ANCHOR_LEVEL), so
-                        # nothing is left to hold onto - reset to None and
-                        # require a brand new >=35 red dot to start over.
+                        # invalidation): don't trust a SHORT until green
+                        # has shown real evidence of declining. This dot
+                        # can't fire (blocked) and can't itself be a
+                        # valid anchor either, so nothing is left to hold
+                        # onto - reset to None and require a brand new
+                        # >=35 red dot to start over.
                         print(f"SHORT trigger valid but uptrend not confirmed broken "
                               f"(green still climbing) - ANCHOR INVALIDATED (Rule 9), "
                               f"trade skipped, must re-anchor")
@@ -675,7 +690,7 @@ def webhook():
                         # carrying the trigger value forward.
                         state["red_anchor"] = None
                         trade_side_to_open = "SHORT"
-                elif value >= ANCHOR_LEVEL:
+                elif value >= RED_ANCHOR_LEVEL:
                     state["red_anchor"] = {"value": value}
                     print(f"NEW RED anchor: {round(value, 2)}")
 
